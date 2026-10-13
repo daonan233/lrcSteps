@@ -1,0 +1,7 @@
+numpy>=2.0,<3
+torch>=2.5,<3
+transformers>=4.45,<6
+pykakasi>=2.3,<3
+sudachipy>=0.6,<1
+sudachidict_core>=2024.0
+imageio-ffmpeg>=0.6,<1

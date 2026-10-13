@@ -1,0 +1,10 @@
+node_modules/
+dist/
+dist-server/
+data/
+data-test/
+.venv/
+worker/vendor/
+__pycache__/
+*.pyc
+.env
