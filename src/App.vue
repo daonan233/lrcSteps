@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { LyricLine, Song, TimedUnit } from './types'
+import TimingEditor from './TimingEditor.vue'
+import MvStudio from './MvStudio.vue'
+import { api } from './api'
 
 interface ImportedLyrics { id: string; japanese: string; romaji: string | null }
 
@@ -23,11 +26,18 @@ const duration = ref(0)
 const playing = ref(false)
 const volume = ref(0.8)
 const editor = ref<LyricLine | null>(null)
+const editorError = ref('')
 const saving = ref(false)
+const workspace = ref<'songs' | 'mv'>('songs')
 let frame = 0
 let poller: ReturnType<typeof setInterval> | undefined
 
-const activeIndex = computed(() => selected.value?.lines.findLastIndex(line => currentTime.value >= line.start) ?? -1)
+const activeIndex = computed(() => {
+  const lines = selected.value?.lines ?? []
+  let index = lines.findLastIndex(line => currentTime.value >= line.start)
+  while (index > 0 && currentTime.value < lines[index - 1].end) index--
+  return index
+})
 const activeLine = computed(() => selected.value?.lines[activeIndex.value])
 const previousLine = computed(() => selected.value?.lines[activeIndex.value - 1])
 const nextLine = computed(() => selected.value?.lines[activeIndex.value + 1] ?? selected.value?.lines[0])
@@ -44,19 +54,6 @@ function formatTime(value: number): string {
 }
 function statusText(song: Song): string {
   return ({ queued: '等待校时', processing: '正在自动校时', ready: '已完成', 'needs-review': '可播放 · 待检查', failed: '处理失败' })[song.status]
-}
-async function api<T>(url: string, options?: RequestInit): Promise<T> {
-  let response: Response
-  try {
-    response = await fetch(url, options)
-  } catch {
-    throw new Error('请求未能完成，可能是连接中断或浏览器阻止了本地请求。请重试；若仍失败，请检查文件大小和本地服务状态。')
-  }
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({}))
-    throw new Error(body.error || `请求失败（${response.status}）`)
-  }
-  return response.status === 204 ? undefined as T : response.json() as Promise<T>
 }
 async function importNeteaseLyrics(): Promise<void> {
   if (!shareLink.value.trim()) { error.value = '请先粘贴网易云音乐歌曲分享链接'; return }
@@ -165,24 +162,36 @@ function onMetadata(): void {
   duration.value = audio.value?.duration || 0
   if (audio.value) audio.value.volume = volume.value
 }
-function openEditor(line: LyricLine): void { editor.value = structuredClone(line); error.value = '' }
-function shiftUnit(units: TimedUnit[], index: number, field: 'start' | 'end', event: Event): void {
-  const value = Number((event.target as HTMLInputElement).value)
-  if (Number.isFinite(value)) units[index][field] = value
+function openEditor(line: LyricLine): void {
+  editor.value = {
+    ...line,
+    units: line.units.map(unit => ({ ...unit })),
+    romajiUnits: line.romajiUnits?.map(unit => ({ ...unit })),
+  }
+  error.value = ''
+  editorError.value = ''
 }
-async function saveEditor(): Promise<void> {
+function closeEditor(): void { editor.value = null; editorError.value = '' }
+function seekEditor(time: number): void { if (audio.value) audio.value.currentTime = time }
+async function previewEditor(time: number): Promise<void> {
+  if (!audio.value) return
+  audio.value.currentTime = time
+  try { await audio.value.play() }
+  catch { editorError.value = '浏览器无法播放这个音频格式' }
+}
+async function saveEditor(units: TimedUnit[], romajiUnits?: TimedUnit[]): Promise<void> {
   if (!selected.value || !editor.value) return
   saving.value = true
-  error.value = ''
+  editorError.value = ''
   try {
     selected.value = await api<Song>(`/api/songs/${selected.value.id}/lines/${editor.value.id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ units: editor.value.units, romajiUnits: editor.value.romajiUnits }),
+      body: JSON.stringify({ units, romajiUnits }),
     })
-    editor.value = null
+    closeEditor()
     await loadSongs()
-  } catch (failure) { error.value = String(failure instanceof Error ? failure.message : failure) }
+  } catch (failure) { editorError.value = String(failure instanceof Error ? failure.message : failure) }
   finally { saving.value = false }
 }
 async function retryAlignment(): Promise<void> {
@@ -226,10 +235,12 @@ onUnmounted(() => { if (poller) clearInterval(poller); cancelAnimationFrame(fram
 
     <main class="main-content">
       <header class="topbar"><div><span class="eyebrow">KARAOKE STUDIO</span><h1>让每一句歌词，都跟上你的节奏。</h1></div><span class="top-pill">✦ 自动逐字校时</span></header>
+      <nav class="workspace-tabs" aria-label="工作区"><button type="button" :class="{ active: workspace === 'songs' }" @click="workspace = 'songs'">歌曲与校时</button><button type="button" :class="{ active: workspace === 'mv' }" @click="workspace = 'mv'">MV 歌词字幕</button></nav>
       <div v-if="error" class="alert error">{{ error }} <button @click="error = ''">×</button></div>
       <div v-if="notice" class="alert notice">{{ notice }} <button @click="notice = ''">×</button></div>
 
-      <section class="upload-card">
+      <MvStudio v-if="workspace === 'mv'" :songs="songs" :selected-song-id="selected?.id" />
+      <section v-if="workspace === 'songs'" class="upload-card">
         <div class="section-title"><span class="section-number">01</span><div><h2>添加一首歌</h2><p>上传音频和普通 LRC，系统会自动估计逐字时间。</p></div></div>
         <form class="upload-form" @submit.prevent="uploadSong">
           <div class="netease-import">
@@ -246,7 +257,7 @@ onUnmounted(() => { if (poller) clearInterval(poller); cancelAnimationFrame(fram
         </form>
       </section>
 
-      <section v-if="selected" class="player-section">
+      <section v-if="workspace === 'songs' && selected" class="player-section">
         <div class="section-title player-title"><span class="section-number">02</span><div><h2>{{ selected.title }}</h2><p>{{ selected.artist || '未知歌手' }} <span class="separator">/</span> {{ statusText(selected) }}</p></div><div class="player-actions"><button v-if="selected.status === 'needs-review'" class="ghost-button" @click="retryAlignment">重新校时</button><button class="ghost-button danger" @click="deleteSong">删除</button></div></div>
         <div v-if="selected.error" class="process-note">{{ selected.error }}</div>
         <div class="stage">
@@ -272,9 +283,9 @@ onUnmounted(() => { if (poller) clearInterval(poller); cancelAnimationFrame(fram
           </div>
         </div>
       </section>
-      <section v-else class="welcome-card"><span>✦</span><h2>选择一首歌，进入你的舞台</h2><p>上传歌曲后，自动校时会在后台运行。处理过程中也能先预览歌词。</p></section>
+      <section v-else-if="workspace === 'songs'" class="welcome-card"><span>✦</span><h2>选择一首歌，进入你的舞台</h2><p>上传歌曲后，自动校时会在后台运行。处理过程中也能先预览歌词。</p></section>
     </main>
 
-    <div v-if="editor" class="modal-backdrop" @click.self="editor = null"><div class="editor-modal"><div class="modal-head"><div><span class="eyebrow">TIMING EDITOR</span><h2>调整逐字时间</h2><p>{{ editor.text }}</p></div><button class="close-button" @click="editor = null">×</button></div><p class="editor-help">时间单位为秒。先点击时间轴上的时间播放这一句，再修改偏差明显的字。</p><div class="editor-scroll"><div class="editor-group"><h3>日文歌词</h3><div v-for="(unit, index) in editor.units" :key="index" class="editor-row"><span class="editor-char">{{ unit.text }}</span><label>开始 <input type="number" min="0" step="0.01" :value="unit.start" @change="shiftUnit(editor.units, index, 'start', $event)" /></label><label>结束 <input type="number" min="0" step="0.01" :value="unit.end" @change="shiftUnit(editor.units, index, 'end', $event)" /></label></div></div><div v-if="editor.romajiUnits" class="editor-group"><h3>罗马音</h3><div v-for="(unit, index) in editor.romajiUnits" :key="index" class="editor-row"><span class="editor-char">{{ unit.text === ' ' ? '␣' : unit.text }}</span><label>开始 <input type="number" min="0" step="0.01" :value="unit.start" @change="shiftUnit(editor.romajiUnits!, index, 'start', $event)" /></label><label>结束 <input type="number" min="0" step="0.01" :value="unit.end" @change="shiftUnit(editor.romajiUnits!, index, 'end', $event)" /></label></div></div></div><div class="modal-actions"><button class="ghost-button" @click="editor = null">取消</button><button class="primary-button" :disabled="saving" @click="saveEditor">{{ saving ? '保存中…' : '保存校时' }}</button></div></div></div>
+    <TimingEditor v-if="editor && selected" :key="editor.id" :song-id="selected.id" :line="editor" :current-time="currentTime" :playing="playing" :saving="saving" :error="editorError" :duration="duration" @seek="seekEditor" @preview="previewEditor" @toggle="togglePlay" @close="closeEditor" @save="saveEditor" />
   </div>
 </template>

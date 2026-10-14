@@ -9,6 +9,7 @@ import { DatabaseSync } from 'node:sqlite'
 import type { Request, Response } from 'express'
 import { createLines, decodeLyrics, parseLrc } from './lyrics.js'
 import { getNeteaseLyrics, parseNeteaseSongId } from './netease.js'
+import { registerMvRoutes } from './mv-routes.js'
 import type { LyricLine, Song, TimedUnit } from './types.js'
 
 const root = process.cwd()
@@ -47,6 +48,7 @@ async function readSong(id: string): Promise<Song | null> {
 async function saveSong(song: Song): Promise<void> {
   storeSong.run(song.id, song.createdAt, JSON.stringify(song))
 }
+const invalidateMvExports = await registerMvRoutes(app, database, dataDir, readSong)
 
 function uploaded(request: Request, key: string): Express.Multer.File | undefined {
   return (request.files as Record<string, Express.Multer.File[]> | undefined)?.[key]?.[0]
@@ -146,17 +148,75 @@ app.put('/api/songs/:id/lines/:lineId', async (request, response) => {
   if (!line) return response.status(404).json({ error: '找不到歌词行' })
   const units = request.body.units as TimedUnit[]
   const romajiUnits = request.body.romajiUnits as TimedUnit[] | undefined
-  if (!validateUnits(units, line.text) || (line.romaji && !validateUnits(romajiUnits, line.romaji))) {
-    return response.status(400).json({ error: '时间轴无效：请保持字的顺序且结束时间晚于开始时间' })
+  const remainingRomaji = Array.isArray(romajiUnits) && romajiUnits.every(unit => unit && typeof unit.text === 'string')
+    ? romajiUnits.map(unit => unit.text).join('') : ''
+  if (!validateUnits(units, line.text) || (line.romaji && (!validateUnits(romajiUnits, remainingRomaji) || !isSubsequence(remainingRomaji, line.romaji)))) {
+    return response.status(400).json({ error: '时间轴无效：罗马音只能删除原有字符，且所有字必须按顺序排列' })
   }
   line.units = units
-  if (line.romaji) line.romajiUnits = romajiUnits
+  if (line.romaji) {
+    line.romaji = remainingRomaji || undefined
+    line.romajiUnits = romajiUnits?.length ? romajiUnits : undefined
+  }
   line.method = 'manual'
   line.confidence = 1
   line.start = Math.min(...units.map(unit => unit.start))
   line.end = Math.max(...units.map(unit => unit.end))
   await saveSong(song)
+  invalidateMvExports(song.id)
   response.json(publicSong(song))
+})
+
+app.post('/api/songs/:id/lines/:lineId/align', async (request, response) => {
+  const song = await readSong(request.params.id)
+  if (!song) return response.status(404).json({ error: '找不到歌曲' })
+  const line = song.lines.find(item => item.id === request.params.lineId)
+  if (!line) return response.status(404).json({ error: '找不到歌词行' })
+  const lane = request.body.lane as 'japanese' | 'romaji' | undefined
+  const units = request.body.units as TimedUnit[] | undefined
+  const romajiUnits = request.body.romajiUnits as TimedUnit[] | undefined
+  const romaji = Array.isArray(romajiUnits) && romajiUnits.every(unit => unit && typeof unit.text === 'string')
+    ? romajiUnits.map(unit => unit.text).join('') : ''
+  if ((lane !== 'japanese' && lane !== 'romaji') || (lane === 'romaji' && !romajiUnits?.length)
+    || !validateUnits(units, line.text)
+    || (line.romaji ? !validateUnits(romajiUnits, romaji) || !isSubsequence(romaji, line.romaji) : Boolean(romajiUnits?.length))) {
+    return response.status(400).json({ error: '当前歌词无效，请检查删除和时间调整后重试' })
+  }
+  const searchUnits = lane === 'romaji' ? romajiUnits! : units
+  const input = path.join(uploadsDir, `${randomUUID()}-line-input.json`)
+  const output = path.join(uploadsDir, `${randomUUID()}-line-output.json`)
+  try {
+    const result = await scheduleAlignment(async () => {
+      const currentLine = {
+        ...line,
+        start: Math.min(...searchUnits.map(unit => unit.start)),
+        end: Math.max(...searchUnits.map(unit => unit.end)),
+        romaji: romaji || undefined,
+      }
+      const nextLine = song.lines[song.lines.findIndex(item => item.id === line.id) + 1]
+      const following = nextLine && nextLine.start - currentLine.end <= 2
+        && nextLine.end > currentLine.end && nextLine.end - currentLine.start <= 20 ? nextLine : undefined
+      await fs.writeFile(input, JSON.stringify({
+        audio: path.join(audioDir, song.audioFile), lines: [currentLine], singleLine: true,
+        following: following ? { text: following.text, end: following.end } : undefined,
+      }), 'utf8')
+      await runWorker(input, output)
+      return JSON.parse(await fs.readFile(output, 'utf8')) as { lines: AlignedLine[]; warning?: string }
+    })
+    const aligned = result.lines.find(item => item.index === 0)
+    if (!aligned || (!validateUnits(aligned.units, line.text) && (!romaji || !validateUnits(aligned.romajiUnits, romaji)))) {
+      return response.status(422).json({ error: '本句未能自动对齐，请继续用滑轨手动调整' })
+    }
+    response.json({
+      units: validateUnits(aligned.units, line.text) ? aligned.units : undefined,
+      romajiUnits: romaji && validateUnits(aligned.romajiUnits, romaji) ? aligned.romajiUnits : undefined,
+      warning: result.warning,
+    })
+  } catch (error) {
+    response.status(502).json({ error: error instanceof Error ? error.message : '本句校时失败' })
+  } finally {
+    await Promise.all([input, output].map(file => fs.rm(file, { force: true }).catch(() => undefined)))
+  }
 })
 
 app.post('/api/songs/:id/retry', async (request, response) => {
@@ -179,16 +239,27 @@ app.delete('/api/songs/:id', async (request, response) => {
 })
 
 function validateUnits(units: TimedUnit[] | undefined, text: string): units is TimedUnit[] {
-  if (!Array.isArray(units) || units.length > 500 || units.map(unit => unit.text).join('') !== text) return false
+  if (!Array.isArray(units) || units.length > 500 || units.some(unit => !unit || typeof unit.text !== 'string') || units.map(unit => unit.text).join('') !== text) return false
   return units.every((unit, index) =>
     Number.isFinite(unit.start) && Number.isFinite(unit.end) && unit.start >= 0 && unit.end > unit.start
     && (index === 0 || unit.start >= units[index - 1].start))
 }
+function isSubsequence(remaining: string, original: string): boolean {
+  const characters = [...remaining]
+  let index = 0
+  for (const character of original) if (character === characters[index]) index++
+  return index === characters.length
+}
 
-interface AlignedLine { index: number; units: TimedUnit[]; romajiUnits?: TimedUnit[]; confidence: number; method: 'aligned' | 'estimated' }
-let queue = Promise.resolve()
+interface AlignedLine { index: number; units?: TimedUnit[]; romajiUnits?: TimedUnit[]; confidence: number; method: 'aligned' | 'estimated' }
+let queue: Promise<void> = Promise.resolve()
+function scheduleAlignment<T>(task: () => Promise<T>): Promise<T> {
+  const job = queue.then(task)
+  queue = job.then(() => undefined, () => undefined)
+  return job
+}
 function enqueueAlignment(id: string): void {
-  queue = queue.then(() => runAlignment(id)).catch(error => console.error('Alignment job failed:', error))
+  void scheduleAlignment(() => runAlignment(id)).catch(error => console.error('Alignment job failed:', error))
 }
 async function runAlignment(id: string): Promise<void> {
   let song = await readSong(id)
@@ -215,6 +286,7 @@ async function runAlignment(id: string): Promise<void> {
     song.status = song.lines.some(line => line.method === 'estimated' || (line.confidence ?? 0) < 0.55) ? 'needs-review' : 'ready'
     song.error = result.warning
     await saveSong(song)
+    invalidateMvExports(song.id)
   } catch (error) {
     song = await readSong(id)
     if (song) {

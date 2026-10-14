@@ -9,7 +9,7 @@
     "dev:web": "vite --host 0.0.0.0",
     "build": "vue-tsc --noEmit && vite build && tsc -p server/tsconfig.json",
     "start": "node dist-server/index.js",
-    "test": "tsx --test server/*.test.ts"
+    "test": "tsc -p server/tsconfig.test.json && node --test dist-tests/*.test.js"
   },
   "dependencies": {
     "express": "^5.1.0",
