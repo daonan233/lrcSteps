@@ -105,6 +105,33 @@ function karaokeText(units: TimedUnit[], offset: number, visibleStart: number): 
   return result
 }
 
+const countdownPreviewSeconds = 4
+const preloadSeconds = 3.5
+const minBreakSeconds = 8
+function lineOnset(line: LyricLine): number { return Math.min(...line.units.map(unit => unit.start)) }
+function lineFinish(line: LyricLine): number { return Math.max(line.end, ...line.units.map(unit => unit.end), ...line.romajiUnits?.map(unit => unit.end) ?? []) }
+function hasBreakBefore(lines: LyricLine[], index: number): boolean {
+  return index === 0 || lineOnset(lines[index]) - lineFinish(lines[index - 1]) >= minBreakSeconds
+}
+function doubleRowStart(lines: LyricLine[], index: number, offset: number): number {
+  const firstStart = Math.max(0, lineOnset(lines[0]) + offset - 2)
+  const ordinaryStart = index < 2 ? firstStart : Math.max(0, lineOnset(lines[index - 1]) + offset)
+  if (index === 0) return Math.max(0, lineOnset(lines[index]) + offset - preloadSeconds)
+  return hasBreakBefore(lines, index)
+    ? Math.max(ordinaryStart, lineOnset(lines[index]) + offset - preloadSeconds)
+    : ordinaryStart
+}
+function doubleRowEnd(lines: LyricLine[], index: number, offset: number, finalEnd: number): number {
+  let end = index + 2 < lines.length ? doubleRowStart(lines, index + 2, offset) : finalEnd
+  for (let next = index + 1; next < lines.length; next++) {
+    if (hasBreakBefore(lines, next)) {
+      end = Math.min(end, lineFinish(lines[next - 1]) + offset + 1.2)
+      break
+    }
+  }
+  return end
+}
+
 export function generateAss(lines: LyricLine[], offsetMs: number, style: MvStyle, width: number, height: number, clipStart = 0, clipDuration?: number, layout: MvLayout = 'single'): string {
   const offset = offsetMs / 1000
   const isDouble = layout === 'double'
@@ -112,12 +139,11 @@ export function generateAss(lines: LyricLine[], offsetMs: number, style: MvStyle
   const romanSize = Math.max(14, Math.round(jpSize * (isDouble ? 0.45 : 0.46)))
   const jpY = Math.round(height * style.vertical)
   const romanY = Math.min(height - 18, jpY + Math.round(jpSize * 0.95))
-  const header = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${width}\nPlayResY: ${height}\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Japanese,Yu Gothic,${jpSize},${assColor(style.afterColor)},${assColor(style.beforeColor)},${assColor(style.outlineColor)},&H80000000&,-1,0,0,0,100,100,0,0,1,${Math.max(2, Math.round(jpSize * 0.07))},1,5,40,40,0,1\nStyle: Romaji,Yu Gothic,${romanSize},${assColor(style.afterColor)},${assColor(style.beforeColor)},${assColor(style.outlineColor)},&H80000000&,0,0,0,0,100,100,0,0,1,${Math.max(1, Math.round(romanSize * 0.08))},1,5,40,40,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n`
+  const header = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${width}\nPlayResY: ${height}\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Japanese,Yu Gothic,${jpSize},${assColor(style.afterColor)},${assColor(style.beforeColor)},${assColor(style.outlineColor)},&H80000000&,-1,0,0,0,100,100,0,0,1,${Math.max(2, Math.round(jpSize * 0.07))},1,5,40,40,0,1\nStyle: Romaji,Yu Gothic,${romanSize},${assColor(style.afterColor)},${assColor(style.beforeColor)},${assColor(style.outlineColor)},&H80000000&,0,0,0,0,100,100,0,0,1,${Math.max(1, Math.round(romanSize * 0.08))},1,5,40,40,0,1\nStyle: Countdown,Yu Gothic,${Math.max(14, Math.round(jpSize * 0.7))},${assColor('#bdbdc4')},${assColor('#bdbdc4')},${assColor(style.outlineColor)},&H80000000&,-1,0,0,0,100,100,0,0,1,${Math.max(1, Math.round(jpSize * 0.04))},1,4,40,40,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n`
   const events: string[] = []
   const visibleLines = lines.filter(line => line.units.length)
-  const lineEnd = (line: LyricLine) => Math.max(line.end, ...line.units.map(unit => unit.end), ...line.romajiUnits?.map(unit => unit.end) ?? [])
-  const rowStart = (index: number) => Math.max(0, (index < 2 ? visibleLines[0].start - 2 : visibleLines[index - 1].start) + offset)
-  const finalEnd = visibleLines.length ? Math.max(...visibleLines.map(lineEnd)) + offset + 2 : 0
+  const rowStart = (index: number) => doubleRowStart(visibleLines, index, offset)
+  const finalEnd = visibleLines.length ? Math.max(...visibleLines.map(lineFinish)) + offset + 2 : 0
   for (const [index, line] of visibleLines.entries()) {
     const left = index % 2 === 0
     const rowX = isDouble ? Math.round(width * (left ? style.leftX : style.rightX)) : Math.round(width / 2)
@@ -137,7 +163,7 @@ export function generateAss(lines: LyricLine[], offsetMs: number, style: MvStyle
       const first = track.units[0].start + offset
       const last = Math.max(...track.units.map(unit => unit.end)) + offset
       const visibleStart = isDouble ? rowStart(index) : first
-      const visibleEnd = isDouble ? (index + 2 < visibleLines.length ? rowStart(index + 2) : finalEnd) : last
+      const visibleEnd = isDouble ? doubleRowEnd(visibleLines, index, offset, finalEnd) : last
       if (visibleEnd <= clipStart || (clipDuration !== undefined && visibleStart >= clipStart + clipDuration)) continue
       const start = Math.max(clipStart, visibleStart)
       const end = clipDuration === undefined ? visibleEnd : Math.min(visibleEnd, clipStart + clipDuration)
@@ -145,6 +171,22 @@ export function generateAss(lines: LyricLine[], offsetMs: number, style: MvStyle
       const fontSize = track.name === 'Japanese' ? jpFontSize : romanFontSize
       const text = `{\\an${isDouble ? left ? 4 : 6 : 5}\\pos(${rowX},${track.y})\\fs${fontSize}}` + karaokeText(track.units, offset, start)
       events.push(`Dialogue: 0,${assTime(start - clipStart)},${assTime(end - clipStart)},${track.name},,0,0,0,,${text}`)
+    }
+    if (isDouble && hasBreakBefore(visibleLines, index)) {
+      const onset = lineOnset(line) + offset
+      const dotSize = Math.max(14, Math.round(jpFontSize * 0.7))
+      const dotY = Math.max(0, Math.round(rowY - jpFontSize * 0.85))
+      for (let phase = 0; phase < countdownPreviewSeconds; phase++) {
+        const phaseStart = Math.max(rowStart(index), onset - countdownPreviewSeconds + phase)
+        const phaseEnd = onset - countdownPreviewSeconds + phase + 1
+        const start = Math.max(clipStart, phaseStart)
+        const end = clipDuration === undefined ? phaseEnd : Math.min(phaseEnd, clipStart + clipDuration)
+        if (end <= start) continue
+        const visibleDots = Math.min(3, countdownPreviewSeconds - phase)
+        const dots = [0, 1, 2].map(dot => '{\\alpha&H' + (dot < visibleDots ? '00' : 'FF') + '&}●').join('\\h')
+        const text = `{\\an${left ? 4 : 6}\\pos(${rowX},${dotY})\\fs${dotSize}}${dots}`
+        events.push(`Dialogue: 1,${assTime(start - clipStart)},${assTime(end - clipStart)},Countdown,,0,0,0,,${text}`)
+      }
     }
   }
   return header + events.join('\n') + '\n'

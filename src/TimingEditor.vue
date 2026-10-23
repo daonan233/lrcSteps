@@ -25,6 +25,10 @@ const draft = ref<LyricLine>({
   units: props.line.units.map(unit => ({ ...unit })),
   romajiUnits: props.line.romajiUnits?.map(unit => ({ ...unit })),
 })
+const romajiText = computed({
+  get: () => draft.value.romajiUnits?.map(unit => unit.text).join('') ?? draft.value.romaji ?? '',
+  set: value => updateRomajiText(value),
+})
 const lane = ref<'japanese' | 'romaji'>('japanese')
 const selectedIndex = ref(0)
 const deletedRomaji = ref<Array<{ unit: TimedUnit; index: number; previousEnd?: number; nextStart?: number }>>([])
@@ -32,7 +36,6 @@ const aligning = ref(false)
 const alignError = ref('')
 const alignNotice = ref('')
 const padding = ref(2)
-const hasRomajiTrack = Boolean(props.line.romajiUnits?.length)
 const units = computed(() => lane.value === 'japanese' ? draft.value.units : draft.value.romajiUnits ?? [])
 const selectedUnit = computed(() => units.value[selectedIndex.value])
 const initialUnits = [...props.line.units, ...props.line.romajiUnits ?? []]
@@ -86,6 +89,26 @@ function segmentStyle(index: number): Record<string, string> {
 }
 function unitProgress(unit: TimedUnit): number {
   return Math.max(0, Math.min(100, (props.currentTime - unit.start) / Math.max(0.01, unit.end - unit.start) * 100))
+}
+function updateRomajiText(value: string): void {
+  const characters = [...new Intl.Segmenter('ja', { granularity: 'grapheme' }).segment(value)].map(item => item.segment)
+  const previous = draft.value.romajiUnits ?? []
+  const currentText = draft.value.romajiUnits ? previous.map(unit => unit.text).join('') : (draft.value.romaji ?? '')
+  if (value === currentText) return
+  const start = previous[0]?.start ?? draft.value.units[0]?.start ?? props.line.start
+  const end = Math.max(start + 0.05, previous.at(-1)?.end ?? draft.value.units.at(-1)?.end ?? props.line.end)
+  draft.value.romajiUnits = characters.length === previous.length
+    ? previous.map((unit, index) => ({ ...unit, text: characters[index] }))
+    : characters.map((text, index) => ({
+      text,
+      start: start + (end - start) * index / characters.length,
+      end: start + (end - start) * (index + 1) / characters.length,
+    }))
+  draft.value.romaji = value || undefined
+  deletedRomaji.value = []
+  selectedIndex.value = Math.max(0, Math.min(selectedIndex.value, characters.length - 1))
+  alignError.value = ''
+  alignNotice.value = ''
 }
 function changeLane(value: 'japanese' | 'romaji'): void { lane.value = value; selectedIndex.value = 0; alignNotice.value = ''; alignError.value = '' }
 function selectUnit(index: number): void { selectedIndex.value = index; emit('seek', units.value[index].start) }
@@ -205,11 +228,12 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <div class="timing-toolbar">
           <div class="timing-tabs" role="tablist" aria-label="歌词轨道">
             <button type="button" role="tab" :aria-selected="lane === 'japanese'" :class="{ active: lane === 'japanese' }" @click="changeLane('japanese')">日文歌词</button>
-            <button v-if="hasRomajiTrack" type="button" role="tab" :aria-selected="lane === 'romaji'" :class="{ active: lane === 'romaji' }" @click="changeLane('romaji')">罗马音</button>
+            <button type="button" role="tab" :aria-selected="lane === 'romaji'" :class="{ active: lane === 'romaji' }" @click="changeLane('romaji')">罗马音</button>
           </div>
           <label class="timing-padding">视野 <select v-model.number="padding"><option :value="2">±2 秒</option><option :value="5">±5 秒</option><option :value="10">±10 秒</option></select></label>
         </div>
-        <p class="timing-hint">随时可以重新校时本句。删除的罗马音不会再显示；校时会参考日文读音，必要时借助下一句定位，并同步更新两条轨道。试听后仍可用滑轨微调。</p>
+        <p class="timing-hint">随时可以重新校时本句。修改或删除罗马音后，校时会使用当前文字，并参考日文读音；试听后仍可用滑轨微调。</p>
+        <label v-if="lane === 'romaji'" class="timing-romaji-edit"><span>本句罗马音</span><input v-model="romajiText" type="text" aria-label="编辑本句罗马音" maxlength="300" spellcheck="false" autocomplete="off" placeholder="在这里输入或修改罗马音" :disabled="aligning || saving" /><small>修改会立即更新预览；增删字符后建议点击“本句重新校时”。</small></label>
         <div class="timing-track-scroll">
           <div class="timing-track" :style="{ width: `${trackGeometry.width}px` }">
             <div class="timing-playhead" :style="{ left: `${playheadLeft}px` }"></div>
@@ -223,7 +247,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           <div class="timing-fine"><span>精确输入</span><label>起点 <input type="number" min="0" step="0.01" :value="selectedUnit.start" @change="boundaryInput('start', $event)" /></label><label>终点 <input type="number" min="0" step="0.01" :value="selectedUnit.end" @change="boundaryInput('end', $event)" /></label></div>
           <div v-if="lane === 'romaji'" class="timing-romaji-actions"><button type="button" class="timing-remove" :aria-label="`删除选中的罗马音 ${selectedUnit.text === ' ' ? '空格' : selectedUnit.text}`" @click="removeSelectedRomaji">删除选中的罗马音</button><button v-if="deletedRomaji.length" type="button" class="timing-undo" @click="undoRomajiRemoval">撤销删除</button></div>
         </div>
-        <div v-else-if="lane === 'romaji'" class="timing-romaji-empty">本行罗马音已全部删除。<button type="button" class="timing-undo" @click="undoRomajiRemoval">撤销删除</button></div>
+        <div v-else-if="lane === 'romaji'" class="timing-romaji-empty">本句没有罗马音，可以在上方输入。<button v-if="deletedRomaji.length" type="button" class="timing-undo" @click="undoRomajiRemoval">撤销删除</button></div>
       </div>
 
       <div v-if="error || alignError" class="timing-error" role="alert">{{ alignError || error }}</div>
@@ -241,6 +265,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .timing-workspace{min-height:0}.timing-toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px}.timing-tabs{display:flex;gap:5px}.timing-tabs button{border:1px solid #49415c;background:#262237;color:#ada5be;border-radius:8px;padding:9px 13px;font-size:12px}.timing-tabs button.active{background:#533c81;border-color:#a585ed;color:white}.timing-padding{display:flex;align-items:center;gap:7px;color:#9b91b1;font-size:11px}.timing-padding select{color:#e2d9ef;background:#29243a;border:1px solid #514765;border-radius:7px;padding:6px}.timing-hint{color:#aaa1ba;font-size:12px;line-height:1.5;margin:11px 0}.timing-track-scroll{overflow-x:auto;overflow-y:hidden;padding:8px 2px 14px;border-radius:10px;background:#131221}.timing-track{height:66px;position:relative;background:linear-gradient(to bottom,transparent 49%,#453c57 50%,transparent 51%)}.timing-segment{position:absolute;top:14px;height:38px;min-width:9px;overflow:hidden;text-overflow:clip;white-space:nowrap;text-align:center;padding:0 2px;border:1px solid #665280;border-radius:5px;background:#443458;color:#e9dff5;font-weight:700;font-size:13px;z-index:1}.timing-segment:hover{background:#6a4e8d}.timing-segment.audible{background:#77609b}.timing-segment.selected{background:#a780f0;border-color:#e2c9ff;color:#150f24;z-index:2;box-shadow:0 0 0 2px #bea4ff55}.timing-playhead{position:absolute;top:0;bottom:0;width:2px;background:#ffe8a1;z-index:3;pointer-events:none;box-shadow:0 0 8px #ffe8a1}
 .timing-focus{margin-top:15px;padding:16px;border:1px solid #433a59;border-radius:12px;background:#252034}.timing-focus-head{display:flex;justify-content:space-between;gap:10px;font-size:12px;color:#c1b5d6;margin-bottom:13px}.timing-focus-head strong{display:inline-grid;place-items:center;margin-left:7px;min-width:30px;min-height:30px;background:#70549e;border-radius:7px;color:#fff;font-size:17px}.timing-focus-head span:last-child{font-variant-numeric:tabular-nums}.timing-boundary{display:grid;grid-template-columns:40px minmax(0,1fr) 65px;align-items:center;gap:12px;margin-top:10px;color:#cfc5de;font-size:12px}.timing-boundary input{width:100%;accent-color:#ad8eff;cursor:ew-resize}.timing-boundary output{text-align:right;font-variant-numeric:tabular-nums;color:#eee0ff}.timing-fine{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:16px;padding-top:13px;border-top:1px solid #433a59;color:#9e94b1;font-size:11px}.timing-fine label{display:flex;align-items:center;gap:7px}.timing-fine input{width:90px;padding:6px 8px;border:1px solid #514861;background:#1c192b;border-radius:6px;color:#eee5f6;font-size:12px}.timing-error{color:#ffb6ca;background:#482535;border-radius:9px;padding:10px 12px;font-size:12px}.timing-actions{display:flex;justify-content:flex-end;gap:9px;padding-top:14px;border-top:1px solid #40384f}.timing-actions button{padding:10px 16px;border-radius:8px;font-size:12px;font-weight:700}.timing-cancel{border:1px solid #51475d;background:#2a2637;color:#e2d8ed}.timing-save{border:0;background:#a584ee;color:#1c1230}.timing-save:disabled{opacity:.6}
 .timing-romaji-actions{display:flex;gap:8px;margin-top:15px}.timing-remove,.timing-undo{border:1px solid #775367;background:#3b283c;color:#ffd6df;border-radius:8px;padding:8px 11px;font-size:12px;cursor:pointer}.timing-undo{border-color:#66557f;background:#302744;color:#e4d6fc}.timing-romaji-empty{margin-top:15px;padding:18px;border:1px dashed #66557f;border-radius:10px;color:#c9bddc;font-size:12px;display:flex;align-items:center;justify-content:space-between;gap:10px}
+.timing-romaji-edit{display:grid;gap:7px;margin:12px 0 14px;color:#d8c9ed;font-size:12px;font-weight:700}.timing-romaji-edit input{width:100%;padding:11px 12px;border:1px solid #66557f;border-radius:9px;background:#211b32;color:#f4ebff;font-size:14px;font-weight:500;letter-spacing:.02em}.timing-romaji-edit input:focus{outline:2px solid #a584f3;outline-offset:1px}.timing-romaji-edit small{color:#a99dbd;font-size:11px;font-weight:400}
 .timing-header,.timing-preview,.timing-workspace,.timing-actions{flex-shrink:0}.timing-workspace.busy{pointer-events:none;opacity:.65}.timing-notice{color:#d7f7dd;background:#244034;border-radius:9px;padding:10px 12px;font-size:12px}.timing-actions{position:sticky;bottom:-24px;z-index:5;background:#1b192a;margin:0 -24px -24px;padding:14px 24px 24px;box-shadow:0 -10px 24px #0b091355}.timing-realign{border:1px solid #856aae;background:#41335e;color:#f0e6ff}.timing-actions button:disabled{opacity:.6;cursor:wait}
 @media(max-width:620px){.timing-backdrop{padding:8px}.timing-modal{padding:15px;gap:13px;max-height:98vh}.timing-preview-jp{font-size:20px}.timing-transport{flex-wrap:wrap}.timing-focus{padding:12px}.timing-boundary{grid-template-columns:32px minmax(0,1fr) 55px;gap:6px}.timing-fine{gap:8px}.timing-tabs button{padding:8px 9px}}
 @media(max-width:620px){.timing-actions{flex-wrap:wrap;bottom:-15px;margin:0 -15px -15px;padding:12px 15px 15px}.timing-realign{margin-left:auto}}

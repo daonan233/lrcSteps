@@ -150,11 +150,12 @@ app.put('/api/songs/:id/lines/:lineId', async (request, response) => {
   const romajiUnits = request.body.romajiUnits as TimedUnit[] | undefined
   const remainingRomaji = Array.isArray(romajiUnits) && romajiUnits.every(unit => unit && typeof unit.text === 'string')
     ? romajiUnits.map(unit => unit.text).join('') : ''
-  if (!validateUnits(units, line.text) || (line.romaji && (!validateUnits(romajiUnits, remainingRomaji) || !isSubsequence(remainingRomaji, line.romaji)))) {
-    return response.status(400).json({ error: '时间轴无效：罗马音只能删除原有字符，且所有字必须按顺序排列' })
+  if (!validateUnits(units, line.text)
+    || (romajiUnits !== undefined && (remainingRomaji.length > 300 || !validateUnits(romajiUnits, remainingRomaji)))) {
+    return response.status(400).json({ error: '时间轴无效：请检查逐字时间和罗马音内容' })
   }
   line.units = units
-  if (line.romaji) {
+  if (romajiUnits !== undefined) {
     line.romaji = remainingRomaji || undefined
     line.romajiUnits = romajiUnits?.length ? romajiUnits : undefined
   }
@@ -179,8 +180,8 @@ app.post('/api/songs/:id/lines/:lineId/align', async (request, response) => {
     ? romajiUnits.map(unit => unit.text).join('') : ''
   if ((lane !== 'japanese' && lane !== 'romaji') || (lane === 'romaji' && !romajiUnits?.length)
     || !validateUnits(units, line.text)
-    || (line.romaji ? !validateUnits(romajiUnits, romaji) || !isSubsequence(romaji, line.romaji) : Boolean(romajiUnits?.length))) {
-    return response.status(400).json({ error: '当前歌词无效，请检查删除和时间调整后重试' })
+    || (romajiUnits !== undefined && (romaji.length > 300 || !validateUnits(romajiUnits, romaji)))) {
+    return response.status(400).json({ error: '当前歌词无效，请检查罗马音文字和时间后重试' })
   }
   const searchUnits = lane === 'romaji' ? romajiUnits! : units
   const input = path.join(uploadsDir, `${randomUUID()}-line-input.json`)
@@ -244,13 +245,6 @@ function validateUnits(units: TimedUnit[] | undefined, text: string): units is T
     Number.isFinite(unit.start) && Number.isFinite(unit.end) && unit.start >= 0 && unit.end > unit.start
     && (index === 0 || unit.start >= units[index - 1].start))
 }
-function isSubsequence(remaining: string, original: string): boolean {
-  const characters = [...remaining]
-  let index = 0
-  for (const character of original) if (character === characters[index]) index++
-  return index === characters.length
-}
-
 interface AlignedLine { index: number; units?: TimedUnit[]; romajiUnits?: TimedUnit[]; confidence: number; method: 'aligned' | 'estimated' }
 let queue: Promise<void> = Promise.resolve()
 function scheduleAlignment<T>(task: () => Promise<T>): Promise<T> {
