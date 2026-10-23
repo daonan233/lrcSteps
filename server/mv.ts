@@ -3,10 +3,25 @@ import type { LyricLine, TimedUnit } from './types.js'
 export interface MvStyle {
   vertical: number
   scale: number
+  leftX: number
+  leftY: number
+  leftScale: number
+  rightX: number
+  rightY: number
+  rightScale: number
   beforeColor: string
   afterColor: string
   outlineColor: string
   showRomaji: boolean
+}
+
+export type MvLayout = 'single' | 'double'
+
+export interface MvOutput {
+  previewFile?: string
+  fullFile?: string
+  previewVersion?: number
+  fullVersion?: number
 }
 
 export interface MvProject {
@@ -26,12 +41,19 @@ export interface MvProject {
   fullVersion?: number
   previewFile?: string
   fullFile?: string
-  render?: { kind: 'preview' | 'full'; status: 'queued' | 'running' | 'failed' | 'complete'; progress: number; error?: string }
+  outputs?: Partial<Record<MvLayout, MvOutput>>
+  render?: { kind: 'preview' | 'full'; layout?: MvLayout; status: 'queued' | 'running' | 'failed' | 'complete'; progress: number; error?: string }
 }
 
 export const defaultMvStyle: MvStyle = {
   vertical: 0.76,
   scale: 1,
+  leftX: 0.07,
+  leftY: 0.69,
+  leftScale: 1,
+  rightX: 0.93,
+  rightY: 0.82,
+  rightScale: 1,
   beforeColor: '#d8d1e8',
   afterColor: '#ffe69a',
   outlineColor: '#17101f',
@@ -43,6 +65,10 @@ export function validMvStyle(value: unknown): value is MvStyle {
   const style = value as Record<string, unknown>
   return typeof style.vertical === 'number' && style.vertical >= 0.15 && style.vertical <= 0.85
     && typeof style.scale === 'number' && style.scale >= 0.6 && style.scale <= 1.6
+    && typeof style.leftX === 'number' && style.leftX >= 0.02 && style.leftX <= 0.48
+    && typeof style.rightX === 'number' && style.rightX >= 0.52 && style.rightX <= 0.98
+    && ['leftY', 'rightY'].every(key => typeof style[key] === 'number' && (style[key] as number) >= 0.08 && (style[key] as number) <= 0.88)
+    && ['leftScale', 'rightScale'].every(key => typeof style[key] === 'number' && (style[key] as number) >= 0.6 && (style[key] as number) <= 1.6)
     && ['beforeColor', 'afterColor', 'outlineColor'].every(key => typeof style[key] === 'string' && /^#[0-9a-fA-F]{6}$/.test(style[key] as string))
     && typeof style.showRomaji === 'boolean'
 }
@@ -79,32 +105,45 @@ function karaokeText(units: TimedUnit[], offset: number, visibleStart: number): 
   return result
 }
 
-export function generateAss(lines: LyricLine[], offsetMs: number, style: MvStyle, width: number, height: number, clipStart = 0, clipDuration?: number): string {
+export function generateAss(lines: LyricLine[], offsetMs: number, style: MvStyle, width: number, height: number, clipStart = 0, clipDuration?: number, layout: MvLayout = 'single'): string {
   const offset = offsetMs / 1000
-  const jpSize = Math.max(22, Math.round(height * 0.055 * style.scale))
-  const romanSize = Math.max(14, Math.round(jpSize * 0.46))
+  const isDouble = layout === 'double'
+  const jpSize = Math.max(22, Math.round(height * (isDouble ? 0.046 * Math.max(style.leftScale, style.rightScale) : 0.055 * style.scale)))
+  const romanSize = Math.max(14, Math.round(jpSize * (isDouble ? 0.45 : 0.46)))
   const jpY = Math.round(height * style.vertical)
   const romanY = Math.min(height - 18, jpY + Math.round(jpSize * 0.95))
   const header = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${width}\nPlayResY: ${height}\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Japanese,Yu Gothic,${jpSize},${assColor(style.afterColor)},${assColor(style.beforeColor)},${assColor(style.outlineColor)},&H80000000&,-1,0,0,0,100,100,0,0,1,${Math.max(2, Math.round(jpSize * 0.07))},1,5,40,40,0,1\nStyle: Romaji,Yu Gothic,${romanSize},${assColor(style.afterColor)},${assColor(style.beforeColor)},${assColor(style.outlineColor)},&H80000000&,0,0,0,0,100,100,0,0,1,${Math.max(1, Math.round(romanSize * 0.08))},1,5,40,40,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n`
   const events: string[] = []
-  for (const line of lines) {
+  const visibleLines = lines.filter(line => line.units.length)
+  const lineEnd = (line: LyricLine) => Math.max(line.end, ...line.units.map(unit => unit.end), ...line.romajiUnits?.map(unit => unit.end) ?? [])
+  const rowStart = (index: number) => Math.max(0, (index < 2 ? visibleLines[0].start - 2 : visibleLines[index - 1].start) + offset)
+  const finalEnd = visibleLines.length ? Math.max(...visibleLines.map(lineEnd)) + offset + 2 : 0
+  for (const [index, line] of visibleLines.entries()) {
+    const left = index % 2 === 0
+    const rowX = isDouble ? Math.round(width * (left ? style.leftX : style.rightX)) : Math.round(width / 2)
+    const rowY = isDouble ? Math.round(height * (left ? style.leftY : style.rightY)) : jpY
+    const sideScale = left ? style.leftScale : style.rightScale
+    const baseJpSize = isDouble ? Math.max(22, Math.round(height * 0.046 * sideScale)) : jpSize
+    const baseRomanSize = isDouble ? Math.max(14, Math.round(baseJpSize * 0.45)) : romanSize
+    const maxTextWidth = isDouble ? width * (left ? 0.96 - style.leftX : style.rightX - 0.04) : width * 0.88
+    const jpFontSize = Math.max(14, Math.min(baseJpSize, Math.floor(maxTextWidth / Math.max(1, line.units.map(unit => unit.text).join('').length))))
+    const romanFontSize = Math.max(10, Math.min(baseRomanSize, Math.floor(maxTextWidth / Math.max(1, (line.romajiUnits ?? []).map(unit => unit.text).join('').length * 0.55))))
     const tracks: Array<{ units: TimedUnit[] | undefined; name: 'Japanese' | 'Romaji'; y: number }> = [
-      { units: line.units, name: 'Japanese', y: jpY },
-      ...(style.showRomaji ? [{ units: line.romajiUnits, name: 'Romaji' as const, y: romanY }] : []),
+      { units: line.units, name: 'Japanese', y: rowY },
+      ...(style.showRomaji ? [{ units: line.romajiUnits, name: 'Romaji' as const, y: isDouble ? Math.round(rowY + jpFontSize * 0.58 + romanFontSize * 0.58 + 2) : romanY }] : []),
     ]
     for (const track of tracks) {
       if (!track.units?.length) continue
       const first = track.units[0].start + offset
       const last = Math.max(...track.units.map(unit => unit.end)) + offset
-      if (last <= clipStart || (clipDuration !== undefined && first >= clipStart + clipDuration)) continue
-      const start = Math.max(clipStart, first)
-      const end = clipDuration === undefined ? last : Math.min(last, clipStart + clipDuration)
+      const visibleStart = isDouble ? rowStart(index) : first
+      const visibleEnd = isDouble ? (index + 2 < visibleLines.length ? rowStart(index + 2) : finalEnd) : last
+      if (visibleEnd <= clipStart || (clipDuration !== undefined && visibleStart >= clipStart + clipDuration)) continue
+      const start = Math.max(clipStart, visibleStart)
+      const end = clipDuration === undefined ? visibleEnd : Math.min(visibleEnd, clipStart + clipDuration)
       if (end <= start) continue
-      const characters = track.units.map(unit => unit.text).join('').length
-      const fontSize = track.name === 'Japanese'
-        ? Math.max(14, Math.min(jpSize, Math.floor(width * 0.88 / Math.max(1, characters))))
-        : Math.max(10, Math.min(romanSize, Math.floor(width * 0.88 / Math.max(1, characters * 0.55))))
-      const text = `{\\an5\\pos(${Math.round(width / 2)},${track.y})\\fs${fontSize}}` + karaokeText(track.units, offset, start)
+      const fontSize = track.name === 'Japanese' ? jpFontSize : romanFontSize
+      const text = `{\\an${isDouble ? left ? 4 : 6 : 5}\\pos(${rowX},${track.y})\\fs${fontSize}}` + karaokeText(track.units, offset, start)
       events.push(`Dialogue: 0,${assTime(start - clipStart)},${assTime(end - clipStart)},${track.name},,0,0,0,,${text}`)
     }
   }

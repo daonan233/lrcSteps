@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto'
 import { createReadStream, existsSync, readdirSync, promises as fs } from 'node:fs'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { defaultMvStyle, estimateAudioOffset, generateAss, pcmEnergy, validMvStyle, type MvProject } from './mv.js'
+import { defaultMvStyle, estimateAudioOffset, generateAss, pcmEnergy, validMvStyle, type MvLayout, type MvOutput, type MvProject } from './mv.js'
 import type { Song } from './types.js'
 
 const uuid = /^[a-f0-9-]{36}$/
@@ -98,17 +98,36 @@ export async function registerMvRoutes(app: Application, database: DatabaseSync,
   function read(id: string): MvProject | null {
     if (!uuid.test(id)) return null
     const row = find.get(id) as { payload: string } | undefined
-    return row ? JSON.parse(row.payload) as MvProject : null
+    if (!row) return null
+    const project = JSON.parse(row.payload) as MvProject
+    return { ...project, style: { ...defaultMvStyle, ...project.style } }
   }
   function save(project: MvProject): void { store.run(project.id, project.createdAt, JSON.stringify(project)) }
+  function outputFor(project: MvProject, layout: MvLayout): MvOutput {
+    const legacy = layout === 'single' ? {
+      previewFile: project.previewFile, fullFile: project.fullFile,
+      previewVersion: project.previewVersion, fullVersion: project.fullVersion,
+    } : {}
+    return { ...legacy, ...project.outputs?.[layout] }
+  }
+  function outputUrl(project: MvProject, layout: MvLayout, kind: 'preview' | 'full'): string | null {
+    const output = outputFor(project, layout)
+    const file = kind === 'preview' ? output.previewFile : output.fullFile
+    const version = kind === 'preview' ? output.previewVersion : output.fullVersion
+    return file && (version ?? 0) === (project.settingsVersion ?? 0)
+      ? `/api/mv-projects/${project.id}/export/${kind}?layout=${layout}` : null
+  }
   function publicProject(project: MvProject) {
-    const { videoFile: _videoFile, previewFile: _previewFile, fullFile: _fullFile, ...rest } = project
+    const { videoFile: _videoFile, previewFile: _previewFile, fullFile: _fullFile, outputs: _outputs, ...rest } = project
     return {
       ...rest,
+      style: { ...defaultMvStyle, ...project.style },
       videoUrl: `/api/mv-projects/${project.id}/video`,
       assUrl: `/api/mv-projects/${project.id}/ass`,
-      previewUrl: project.previewFile && (project.previewVersion ?? 0) === (project.settingsVersion ?? 0) ? `/api/mv-projects/${project.id}/export/preview` : null,
-      fullUrl: project.fullFile && (project.fullVersion ?? 0) === (project.settingsVersion ?? 0) ? `/api/mv-projects/${project.id}/export/full` : null,
+      exportUrls: {
+        single: { preview: outputUrl(project, 'single', 'preview'), full: outputUrl(project, 'single', 'full') },
+        double: { preview: outputUrl(project, 'double', 'preview'), full: outputUrl(project, 'double', 'full') },
+      },
     }
   }
   for (const row of list.all() as { payload: string }[]) {
@@ -162,14 +181,15 @@ export async function registerMvRoutes(app: Application, database: DatabaseSync,
     const project = read(request.params.id)
     if (!project) return response.status(404).json({ error: '找不到 MV 项目' })
     const offsetMs = Number(request.body.offsetMs)
-    if (!Number.isInteger(offsetMs) || offsetMs < -600000 || offsetMs > 600000 || !validMvStyle(request.body.style)) {
+    const nextStyle = { ...defaultMvStyle, ...request.body.style }
+    if (!Number.isInteger(offsetMs) || offsetMs < -600000 || offsetMs > 600000 || !validMvStyle(nextStyle)) {
       return response.status(400).json({ error: '歌词偏移或字幕样式无效' })
     }
-    if (project.offsetMs !== offsetMs || JSON.stringify(project.style) !== JSON.stringify(request.body.style)) {
+    if (project.offsetMs !== offsetMs || JSON.stringify(project.style) !== JSON.stringify(nextStyle)) {
       project.settingsVersion = (project.settingsVersion ?? 0) + 1
     }
     project.offsetMs = offsetMs
-    project.style = request.body.style
+    project.style = nextStyle
     save(project)
     response.json(publicProject(project))
   })
@@ -185,9 +205,10 @@ export async function registerMvRoutes(app: Application, database: DatabaseSync,
     if (!project) return response.status(404).json({ error: '找不到 MV 项目' })
     const song = await readSong(project.songId)
     if (!song) return response.status(404).json({ error: '关联的歌曲已被删除' })
+    const layout = request.query.layout === 'double' ? 'double' : 'single'
     response.setHeader('Content-Type', 'text/plain; charset=utf-8')
-    response.setHeader('Content-Disposition', `attachment; filename="${project.id}.ass"`)
-    response.send(generateAss(song.lines, project.offsetMs, project.style, project.width, project.height))
+    response.setHeader('Content-Disposition', `attachment; filename="${project.id}-${layout}.ass"`)
+    response.send(generateAss(song.lines, project.offsetMs, project.style, project.width, project.height, 0, undefined, layout))
   })
   app.post('/api/mv-projects/:id/sync', async (request, response) => {
     const project = read(request.params.id)
@@ -214,19 +235,19 @@ export async function registerMvRoutes(app: Application, database: DatabaseSync,
   })
 
   let renderQueue = Promise.resolve()
-  async function renderProject(id: string, kind: 'preview' | 'full', previewStart: number): Promise<void> {
+  async function renderProject(id: string, kind: 'preview' | 'full', previewStart: number, layout: MvLayout): Promise<void> {
     const project = read(id)
     if (!project) return
     const song = await readSong(project.songId)
     if (!song) throw new Error('关联的歌曲已被删除')
-    project.render = { kind, status: 'running', progress: 0 }
+    project.render = { kind, layout, status: 'running', progress: 0 }
     save(project)
     const clipStart = kind === 'preview' ? previewStart : 0
     const clipDuration = kind === 'preview' ? Math.min(30, project.duration - clipStart) : project.duration
     const renderVersion = project.settingsVersion ?? 0
-    const assFile = path.join(outputDir, `${id}-${kind}.ass`)
-    const outputFile = path.join(outputDir, `${id}-${kind}-${randomUUID()}.mp4`)
-    await fs.writeFile(assFile, generateAss(song.lines, project.offsetMs, project.style, project.width, project.height, clipStart, clipDuration), 'utf8')
+    const assFile = path.join(outputDir, `${id}-${layout}-${kind}.ass`)
+    const outputFile = path.join(outputDir, `${id}-${layout}-${kind}-${randomUUID()}.mp4`)
+    await fs.writeFile(assFile, generateAss(song.lines, project.offsetMs, project.style, project.width, project.height, clipStart, clipDuration, layout), 'utf8')
     const args = ['-y', '-hide_banner', '-loglevel', 'error', '-progress', 'pipe:1']
     if (clipStart > 0) args.push('-ss', String(clipStart))
     args.push('-i', path.join(uploadDir, project.videoFile))
@@ -265,10 +286,13 @@ export async function registerMvRoutes(app: Application, database: DatabaseSync,
     if (!stat.size) throw new Error('FFmpeg 没有生成有效的视频文件')
     const latest = read(id)
     if (latest) {
-      const previousFile = kind === 'preview' ? latest.previewFile : latest.fullFile
-      if (kind === 'preview') { latest.previewFile = path.basename(outputFile); latest.previewVersion = renderVersion }
-      else { latest.fullFile = path.basename(outputFile); latest.fullVersion = renderVersion }
-      latest.render = { kind, status: 'complete', progress: 100 }
+      const previous = outputFor(latest, layout)
+      const previousFile = kind === 'preview' ? previous.previewFile : previous.fullFile
+      const output = { ...previous }
+      if (kind === 'preview') { output.previewFile = path.basename(outputFile); output.previewVersion = renderVersion }
+      else { output.fullFile = path.basename(outputFile); output.fullVersion = renderVersion }
+      latest.outputs = { ...latest.outputs, [layout]: output }
+      latest.render = { kind, layout, status: 'complete', progress: 100 }
       save(latest)
       if (previousFile) await fs.rm(path.join(outputDir, previousFile), { force: true }).catch(() => undefined)
     }
@@ -279,14 +303,16 @@ export async function registerMvRoutes(app: Application, database: DatabaseSync,
     if (project.render?.status === 'queued' || project.render?.status === 'running') return response.status(409).json({ error: '已有视频正在导出' })
     const kind = request.body.kind
     if (kind !== 'preview' && kind !== 'full') return response.status(400).json({ error: '无效的导出类型' })
+    const layout = request.body.layout === 'double' ? 'double' : request.body.layout === 'single' || request.body.layout === undefined ? 'single' : null
+    if (!layout) return response.status(400).json({ error: '无效的字幕版本' })
     const previewStart = kind === 'preview' ? Number(request.body.start ?? 0) : 0
     if (!Number.isFinite(previewStart) || previewStart < 0 || previewStart >= project.duration) return response.status(400).json({ error: '预览起点超出 MV 时长' })
-    project.render = { kind, status: 'queued', progress: 0 }
+    project.render = { kind, layout, status: 'queued', progress: 0 }
     save(project)
-    renderQueue = renderQueue.then(() => renderProject(project.id, kind, previewStart)).catch(failure => {
+    renderQueue = renderQueue.then(() => renderProject(project.id, kind, previewStart, layout)).catch(failure => {
       const latest = read(project.id)
       if (latest) {
-        latest.render = { kind, status: 'failed', progress: 0, error: failure instanceof Error ? failure.message : '视频导出失败' }
+        latest.render = { kind, layout, status: 'failed', progress: 0, error: failure instanceof Error ? failure.message : '视频导出失败' }
         save(latest)
       }
     })
@@ -295,15 +321,18 @@ export async function registerMvRoutes(app: Application, database: DatabaseSync,
   app.get('/api/mv-projects/:id/export/:kind', async (request, response) => {
     const project = read(request.params.id)
     if (!project) return response.status(404).end()
-    const file = request.params.kind === 'preview' && (project.previewVersion ?? 0) === (project.settingsVersion ?? 0) ? project.previewFile : request.params.kind === 'full' && (project.fullVersion ?? 0) === (project.settingsVersion ?? 0) ? project.fullFile : undefined
+    const layout = request.query.layout === 'double' ? 'double' : 'single'
+    const output = outputFor(project, layout)
+    const file = request.params.kind === 'preview' && (output.previewVersion ?? 0) === (project.settingsVersion ?? 0) ? output.previewFile : request.params.kind === 'full' && (output.fullVersion ?? 0) === (project.settingsVersion ?? 0) ? output.fullFile : undefined
     if (!file) return response.status(404).end()
-    await streamFile(request, response, path.join(outputDir, file), 'video/mp4', `${project.id}-${request.params.kind}.mp4`)
+    await streamFile(request, response, path.join(outputDir, file), 'video/mp4', `${project.id}-${layout}-${request.params.kind}.mp4`)
   })
   app.delete('/api/mv-projects/:id', async (request, response) => {
     const project = read(request.params.id)
     if (!project) return response.status(404).json({ error: '找不到 MV 项目' })
     if (project.render?.status === 'queued' || project.render?.status === 'running') return response.status(409).json({ error: '请等待视频导出结束后再删除' })
-    await Promise.all([path.join(uploadDir, project.videoFile), project.previewFile && path.join(outputDir, project.previewFile), project.fullFile && path.join(outputDir, project.fullFile), ...['preview', 'full'].map(kind => path.join(outputDir, `${project.id}-${kind}.ass`))].filter((file): file is string => Boolean(file)).map(file => fs.rm(file, { force: true }).catch(() => undefined)))
+    const files = [project.previewFile, project.fullFile, ...Object.values(project.outputs ?? {}).flatMap(output => [output?.previewFile, output?.fullFile])]
+    await Promise.all([path.join(uploadDir, project.videoFile), ...files.filter((file): file is string => Boolean(file)).map(file => path.join(outputDir, file)), ...['preview', 'full'].flatMap(kind => [path.join(outputDir, `${project.id}-${kind}.ass`), ...(['single', 'double'] as const).map(layout => path.join(outputDir, `${project.id}-${layout}-${kind}.ass`))])].map(file => fs.rm(file, { force: true }).catch(() => undefined)))
     remove.run(project.id)
     response.status(204).end()
   })
