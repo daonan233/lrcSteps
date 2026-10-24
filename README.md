@@ -41,6 +41,8 @@ npm run dev
 
 MP4 导出由服务端 FFmpeg 烧录字幕并保留 MV 原音轨；原始 MV 和生成文件都保存在本机 `data/mv/`。导出在后台执行，页面显示进度。为保证 MP4 导出可用，FFmpeg 需要带 `ass`/libass、`libx264` 和 `aac` 编码支持；可设置 `FFMPEG_PATH` 指向其可执行文件。通过 `worker/requirements.txt` 安装的 `imageio-ffmpeg` 在此 Windows 环境也可供项目使用。部分 MOV/MKV 编码可能无法由浏览器直接预览，但仍可尝试导出。ASS 的时间精度为百分之一秒，导出前建议试听确认。
 
+网页预览和 MP4 导出使用项目内的 Noto Sans JP ExtraBold（日文）及 DM Sans Bold（罗马音）字体，授权文本位于 `assets/licenses/`。更新字幕样式或项目的渲染版本后，请重新导出 MP4；旧视频中的字幕不会自动改变。
+
 ## 自动校时过程
 
 1. 普通 LRC 给出每行歌词的搜索时间窗。

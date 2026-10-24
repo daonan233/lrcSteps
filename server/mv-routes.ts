@@ -9,6 +9,7 @@ import { defaultMvStyle, estimateAudioOffset, generateAss, pcmEnergy, validMvSty
 import type { Song } from './types.js'
 
 const uuid = /^[a-f0-9-]{36}$/
+const rendererVersion = 1
 
 function ffmpegPath(root: string): string {
   if (process.env.FFMPEG_PATH) return process.env.FFMPEG_PATH
@@ -90,6 +91,10 @@ export async function registerMvRoutes(app: Application, database: DatabaseSync,
   const uploadDir = path.join(mvDir, 'uploads')
   const outputDir = path.join(mvDir, 'outputs')
   await Promise.all([uploadDir, outputDir].map(dir => fs.mkdir(dir, { recursive: true })))
+  const renderFontsDir = path.join(outputDir, 'fonts')
+  await fs.mkdir(renderFontsDir, { recursive: true })
+  await Promise.all(['NotoSansJP-ExtraBold.ttf', 'DMSans-Bold.ttf'].map(font =>
+    fs.copyFile(path.join(root, 'assets', 'fonts', font), path.join(renderFontsDir, font))))
   database.exec('CREATE TABLE IF NOT EXISTS mv_projects (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL)')
   const find = database.prepare('SELECT payload FROM mv_projects WHERE id = ?')
   const list = database.prepare('SELECT payload FROM mv_projects ORDER BY created_at DESC')
@@ -114,7 +119,8 @@ export async function registerMvRoutes(app: Application, database: DatabaseSync,
     const output = outputFor(project, layout)
     const file = kind === 'preview' ? output.previewFile : output.fullFile
     const version = kind === 'preview' ? output.previewVersion : output.fullVersion
-    return file && (version ?? 0) === (project.settingsVersion ?? 0)
+    const fontVersion = kind === 'preview' ? output.previewRendererVersion : output.fullRendererVersion
+    return file && (version ?? 0) === (project.settingsVersion ?? 0) && fontVersion === rendererVersion
       ? `/api/mv-projects/${project.id}/export/${kind}?layout=${layout}` : null
   }
   function publicProject(project: MvProject) {
@@ -252,7 +258,7 @@ export async function registerMvRoutes(app: Application, database: DatabaseSync,
     if (clipStart > 0) args.push('-ss', String(clipStart))
     args.push('-i', path.join(uploadDir, project.videoFile))
     if (kind === 'preview') args.push('-t', String(clipDuration))
-    args.push('-map', '0:v:0', '-map', '0:a?', '-vf', `ass=${path.basename(assFile)}`, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', outputFile)
+    args.push('-map', '0:v:0', '-map', '0:a?', '-vf', `ass=${path.basename(assFile)}:fontsdir=fonts`, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', outputFile)
     try { await new Promise<void>((resolve, reject) => {
       const child = spawn(binary, args, { cwd: outputDir, windowsHide: true })
       let stderr = ''
@@ -289,8 +295,8 @@ export async function registerMvRoutes(app: Application, database: DatabaseSync,
       const previous = outputFor(latest, layout)
       const previousFile = kind === 'preview' ? previous.previewFile : previous.fullFile
       const output = { ...previous }
-      if (kind === 'preview') { output.previewFile = path.basename(outputFile); output.previewVersion = renderVersion }
-      else { output.fullFile = path.basename(outputFile); output.fullVersion = renderVersion }
+      if (kind === 'preview') { output.previewFile = path.basename(outputFile); output.previewVersion = renderVersion; output.previewRendererVersion = rendererVersion }
+      else { output.fullFile = path.basename(outputFile); output.fullVersion = renderVersion; output.fullRendererVersion = rendererVersion }
       latest.outputs = { ...latest.outputs, [layout]: output }
       latest.render = { kind, layout, status: 'complete', progress: 100 }
       save(latest)
@@ -323,7 +329,7 @@ export async function registerMvRoutes(app: Application, database: DatabaseSync,
     if (!project) return response.status(404).end()
     const layout = request.query.layout === 'double' ? 'double' : 'single'
     const output = outputFor(project, layout)
-    const file = request.params.kind === 'preview' && (output.previewVersion ?? 0) === (project.settingsVersion ?? 0) ? output.previewFile : request.params.kind === 'full' && (output.fullVersion ?? 0) === (project.settingsVersion ?? 0) ? output.fullFile : undefined
+    const file = request.params.kind === 'preview' && (output.previewVersion ?? 0) === (project.settingsVersion ?? 0) && output.previewRendererVersion === rendererVersion ? output.previewFile : request.params.kind === 'full' && (output.fullVersion ?? 0) === (project.settingsVersion ?? 0) && output.fullRendererVersion === rendererVersion ? output.fullFile : undefined
     if (!file) return response.status(404).end()
     await streamFile(request, response, path.join(outputDir, file), 'video/mp4', `${project.id}-${layout}-${request.params.kind}.mp4`)
   })

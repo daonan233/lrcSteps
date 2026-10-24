@@ -22,6 +22,8 @@ export interface MvOutput {
   fullFile?: string
   previewVersion?: number
   fullVersion?: number
+  previewRendererVersion?: number
+  fullRendererVersion?: number
 }
 
 export interface MvProject {
@@ -139,7 +141,7 @@ export function generateAss(lines: LyricLine[], offsetMs: number, style: MvStyle
   const romanSize = Math.max(14, Math.round(jpSize * (isDouble ? 0.45 : 0.46)))
   const jpY = Math.round(height * style.vertical)
   const romanY = Math.min(height - 18, jpY + Math.round(jpSize * 0.95))
-  const header = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${width}\nPlayResY: ${height}\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Japanese,Yu Gothic,${jpSize},${assColor(style.afterColor)},${assColor(style.beforeColor)},${assColor(style.outlineColor)},&H80000000&,-1,0,0,0,100,100,0,0,1,${Math.max(2, Math.round(jpSize * 0.07))},1,5,40,40,0,1\nStyle: Romaji,Yu Gothic,${romanSize},${assColor(style.afterColor)},${assColor(style.beforeColor)},${assColor(style.outlineColor)},&H80000000&,0,0,0,0,100,100,0,0,1,${Math.max(1, Math.round(romanSize * 0.08))},1,5,40,40,0,1\nStyle: Countdown,Yu Gothic,${Math.max(14, Math.round(jpSize * 0.7))},${assColor('#bdbdc4')},${assColor('#bdbdc4')},${assColor(style.outlineColor)},&H80000000&,-1,0,0,0,100,100,0,0,1,${Math.max(1, Math.round(jpSize * 0.04))},1,4,40,40,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n`
+  const header = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${width}\nPlayResY: ${height}\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Japanese,Noto Sans JP ExtraBold,${jpSize},${assColor(style.afterColor)},${assColor(style.beforeColor)},${assColor(style.outlineColor)},&H80000000&,-1,0,0,0,100,100,0,0,1,${Math.max(2, Math.round(jpSize * 0.07))},1,5,40,40,0,1\nStyle: Romaji,DM Sans 14pt,${romanSize},${assColor(style.afterColor)},${assColor(style.beforeColor)},${assColor(style.outlineColor)},&H80000000&,0,0,0,0,100,100,0,0,1,${Math.max(1, Math.round(romanSize * 0.08))},1,5,40,40,0,1\nStyle: Countdown,Noto Sans JP ExtraBold,${Math.max(14, Math.round(jpSize * 0.7))},${assColor('#bdbdc4')},${assColor('#bdbdc4')},${assColor(style.outlineColor)},&H80000000&,-1,0,0,0,100,100,0,0,1,${Math.max(1, Math.round(jpSize * 0.04))},1,4,40,40,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n`
   const events: string[] = []
   const visibleLines = lines.filter(line => line.units.length)
   const rowStart = (index: number) => doubleRowStart(visibleLines, index, offset)
@@ -169,7 +171,8 @@ export function generateAss(lines: LyricLine[], offsetMs: number, style: MvStyle
       const end = clipDuration === undefined ? visibleEnd : Math.min(visibleEnd, clipStart + clipDuration)
       if (end <= start) continue
       const fontSize = track.name === 'Japanese' ? jpFontSize : romanFontSize
-      const text = `{\\an${isDouble ? left ? 4 : 6 : 5}\\pos(${rowX},${track.y})\\fs${fontSize}}` + karaokeText(track.units, offset, start)
+      const weight = track.name === 'Japanese' ? 800 : 700
+      const text = `{\\an${isDouble ? left ? 4 : 6 : 5}\\pos(${rowX},${track.y})\\fs${fontSize}\\b${weight}}` + karaokeText(track.units, offset, start)
       events.push(`Dialogue: 0,${assTime(start - clipStart)},${assTime(end - clipStart)},${track.name},,0,0,0,,${text}`)
     }
     if (isDouble && hasBreakBefore(visibleLines, index)) {
