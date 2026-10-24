@@ -61,7 +61,7 @@ watch(stage, element => {
 
 const activeLine = computed<LyricLine | null>(() => {
   const lines = linkedSong.value?.lines ?? []
-  const songTime = videoTime.value - offsetMs.value / 1000
+  const songTime = videoTime.value - (offsetMs.value + (linkedSong.value?.lyricsDelayMs ?? 0)) / 1000
   for (let index = lines.length - 1; index >= 0; index--) {
     const line = lines[index]
     const start = Math.min(...line.units.map(unit => unit.start))
@@ -99,9 +99,9 @@ function doubleRowEnd(lines: LyricLine[], index: number, offset: number, finalEn
 const doubleRows = computed(() => {
   const lines = (linkedSong.value?.lines ?? []).filter(line => line.units.length)
   if (!lines.length) return []
-  const offset = offsetMs.value / 1000
+  const offset = (offsetMs.value + (linkedSong.value?.lyricsDelayMs ?? 0)) / 1000
   const finalEnd = Math.max(...lines.map(lineFinish)) + offset + 2
-  const rows: Array<{ line: LyricLine; slot: number; countdown: number }> = []
+  const rows: Array<{ line: LyricLine; slot: number; countdown: number; cutoff: number }> = []
   for (let slot = 0; slot < 2; slot++) {
     for (let index = lines.length - 1; index >= 0; index--) {
       if (index % 2 !== slot) continue
@@ -112,7 +112,7 @@ const doubleRows = computed(() => {
         const countdown = hasBreakBefore(lines, index) && remaining > 0 && remaining <= countdownPreviewSeconds
           ? remaining > 2 ? 3 : remaining > 1 ? 2 : 1
           : -1
-        rows.push({ line: lines[index], slot, countdown })
+        rows.push({ line: lines[index], slot, countdown, cutoff: lines[index + 1] ? lineOnset(lines[index + 1]) : Infinity })
         break
       }
     }
@@ -153,8 +153,9 @@ function doubleGeometry(line: LyricLine, slot: number): { top: string; left: str
     jpSize: `${jpSize * ratio}px`, romanSize: `${romanSize * ratio}px`,
   }
 }
-function unitProgress(unit: TimedUnit): number {
-  const songTime = videoTime.value - offsetMs.value / 1000
+function unitProgress(unit: TimedUnit, cutoff = Infinity): number {
+  const songTime = videoTime.value - (offsetMs.value + (linkedSong.value?.lyricsDelayMs ?? 0)) / 1000
+  if (songTime >= cutoff) return 100
   return Math.max(0, Math.min(100, (songTime - unit.start) / Math.max(0.01, unit.end - unit.start) * 100))
 }
 function formatTime(seconds: number): string {
@@ -232,7 +233,7 @@ async function exportVideo(kind: 'preview' | 'full'): Promise<void> {
   await saveSettings()
   if (error.value || !project.value) return
   const first = linkedSong.value?.lines[0]?.start ?? 0
-  const start = kind === 'preview' ? Math.min(project.value.duration - 0.1, Math.max(0, videoTime.value || first + offsetMs.value / 1000 - 2)) : 0
+  const start = kind === 'preview' ? Math.min(project.value.duration - 0.1, Math.max(0, videoTime.value || first + (offsetMs.value + (linkedSong.value?.lyricsDelayMs ?? 0)) / 1000 - 2)) : 0
   try {
     project.value = await api<MvProject>(`/api/mv-projects/${project.value.id}/export`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind, start, layout: layout.value }),
@@ -274,7 +275,7 @@ async function toggleVideo(): Promise<void> {
   } else video.value.pause()
 }
 function jumpToFirstLine(): void {
-  if (video.value && linkedSong.value?.lines.length) video.value.currentTime = Math.max(0, linkedSong.value.lines[0].start + offsetMs.value / 1000)
+  if (video.value && linkedSong.value?.lines.length) video.value.currentTime = Math.max(0, linkedSong.value.lines[0].start + (offsetMs.value + (linkedSong.value.lyricsDelayMs ?? 0)) / 1000)
 }
 
 onMounted(async () => {
@@ -296,7 +297,7 @@ onUnmounted(() => { if (poller) clearInterval(poller); cancelAnimationFrame(fram
       <div class="mv-section-head"><span class="mv-number">01</span><div><h2>添加 MV</h2><p>关联一首已校时的歌曲，把日文和罗马音叠到视频画面。</p></div></div>
       <form class="mv-upload" @submit.prevent="uploadProject">
         <label class="mv-file"><span>▣</span><strong>{{ videoFile?.name || '选择 MV 文件' }}</strong><small>MP4、MOV、WebM、MKV · 最大 1 GB</small><input type="file" accept=".mp4,.mov,.webm,.mkv,video/*" @change="videoFile = ($event.target as HTMLInputElement).files?.[0] ?? null" /></label>
-        <div class="mv-upload-controls"><label>关联歌曲<select v-model="chosenSongId"><option disabled value="">请选择歌曲</option><option v-for="song in songs" :key="song.id" :value="song.id">{{ song.title }}</option></select></label><label>项目名称<input v-model="projectTitle" type="text" placeholder="默认使用歌曲名称" maxlength="120" /></label><button class="mv-primary" type="submit" :disabled="uploading || !songs.length">{{ uploading ? '上传中…' : '上传 MV' }}</button></div>
+        <div class="mv-upload-controls"><label>关联歌曲<select v-model="chosenSongId"><option disabled value="">请选择歌曲</option><option v-for="song in songs" :key="song.id" :value="song.id">{{ song.title }} · {{ song.lineCount }} 行 · 已校正 {{ song.manualCount ?? 0 }} 句</option></select></label><label>项目名称<input v-model="projectTitle" type="text" placeholder="默认使用歌曲名称" maxlength="120" /></label><button class="mv-primary" type="submit" :disabled="uploading || !songs.length">{{ uploading ? '上传中…' : '上传 MV' }}</button></div>
       </form>
     </section>
 
@@ -313,8 +314,8 @@ onUnmounted(() => { if (poller) clearInterval(poller); cancelAnimationFrame(fram
         </div>
         <div v-for="row in layout === 'double' ? doubleRows : []" :key="row.line.id" class="mv-lyrics mv-double" :class="row.slot === 0 ? 'mv-left' : 'mv-right'" :style="{ top: doubleGeometry(row.line, row.slot).top, left: doubleGeometry(row.line, row.slot).left, right: doubleGeometry(row.line, row.slot).right, maxWidth: doubleGeometry(row.line, row.slot).maxWidth, '--before': style.beforeColor, '--after': style.afterColor, '--outline': style.outlineColor, '--jp-size': doubleGeometry(row.line, row.slot).jpSize, '--roman-size': doubleGeometry(row.line, row.slot).romanSize }">
           <div v-if="row.countdown >= 0" class="mv-countdown" aria-label="即将开唱"><span v-for="dot in 3" :key="dot" :class="{ hidden: dot > row.countdown }">●</span></div>
-          <div class="mv-jp"><span v-for="(unit, index) in row.line.units" :key="index" class="mv-unit"><span class="mv-base">{{ unit.text }}</span><span class="mv-fill" :style="{ width: `${unitProgress(unit)}%` }">{{ unit.text }}</span></span></div>
-          <div v-if="style.showRomaji && row.line.romajiUnits?.length" class="mv-roman"><span v-for="(unit, index) in row.line.romajiUnits" :key="index" class="mv-unit"><span class="mv-base">{{ unit.text }}</span><span class="mv-fill" :style="{ width: `${unitProgress(unit)}%` }">{{ unit.text }}</span></span></div>
+          <div class="mv-jp"><span v-for="(unit, index) in row.line.units" :key="index" class="mv-unit"><span class="mv-base">{{ unit.text }}</span><span class="mv-fill" :style="{ width: `${unitProgress(unit, row.cutoff)}%` }">{{ unit.text }}</span></span></div>
+          <div v-if="style.showRomaji && row.line.romajiUnits?.length" class="mv-roman"><span v-for="(unit, index) in row.line.romajiUnits" :key="index" class="mv-unit"><span class="mv-base">{{ unit.text }}</span><span class="mv-fill" :style="{ width: `${unitProgress(unit, row.cutoff)}%` }">{{ unit.text }}</span></span></div>
         </div>
       </div>
       <div class="mv-video-transport"><button type="button" :aria-label="playing ? '暂停 MV' : '播放 MV'" @click="toggleVideo">{{ playing ? '❚❚' : '▶' }}</button><span>{{ formatTime(videoTime) }}</span><input type="range" aria-label="MV 试听进度" min="0" :max="project.duration" step="0.01" :value="videoTime" @input="seekVideo" /><span>{{ formatTime(project.duration) }}</span><button type="button" @click="jumpToFirstLine">跳到首句</button></div>

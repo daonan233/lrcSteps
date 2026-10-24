@@ -214,7 +214,7 @@ export async function registerMvRoutes(app: Application, database: DatabaseSync,
     const layout = request.query.layout === 'double' ? 'double' : 'single'
     response.setHeader('Content-Type', 'text/plain; charset=utf-8')
     response.setHeader('Content-Disposition', `attachment; filename="${project.id}-${layout}.ass"`)
-    response.send(generateAss(song.lines, project.offsetMs, project.style, project.width, project.height, 0, undefined, layout))
+    response.send(generateAss(song.lines, project.offsetMs + (song.lyricsDelayMs ?? 0), project.style, project.width, project.height, 0, undefined, layout))
   })
   app.post('/api/mv-projects/:id/sync', async (request, response) => {
     const project = read(request.params.id)
@@ -253,7 +253,7 @@ export async function registerMvRoutes(app: Application, database: DatabaseSync,
     const renderVersion = project.settingsVersion ?? 0
     const assFile = path.join(outputDir, `${id}-${layout}-${kind}.ass`)
     const outputFile = path.join(outputDir, `${id}-${layout}-${kind}-${randomUUID()}.mp4`)
-    await fs.writeFile(assFile, generateAss(song.lines, project.offsetMs, project.style, project.width, project.height, clipStart, clipDuration, layout), 'utf8')
+    await fs.writeFile(assFile, generateAss(song.lines, project.offsetMs + (song.lyricsDelayMs ?? 0), project.style, project.width, project.height, clipStart, clipDuration, layout), 'utf8')
     const args = ['-y', '-hide_banner', '-loglevel', 'error', '-progress', 'pipe:1']
     if (clipStart > 0) args.push('-ss', String(clipStart))
     args.push('-i', path.join(uploadDir, project.videoFile))

@@ -165,15 +165,27 @@ export function generateAss(lines: LyricLine[], offsetMs: number, style: MvStyle
       const first = track.units[0].start + offset
       const last = Math.max(...track.units.map(unit => unit.end)) + offset
       const visibleStart = isDouble ? rowStart(index) : first
-      const visibleEnd = isDouble ? doubleRowEnd(visibleLines, index, offset, finalEnd) : last
+      const cutoff = visibleLines[index + 1] ? lineOnset(visibleLines[index + 1]) + offset : Infinity
+      const rowEnd = isDouble ? doubleRowEnd(visibleLines, index, offset, finalEnd) : last
+      const visibleEnd = isDouble ? rowEnd : Math.min(rowEnd, cutoff)
+      const sweepCutoff = last > cutoff ? cutoff : Infinity
       if (visibleEnd <= clipStart || (clipDuration !== undefined && visibleStart >= clipStart + clipDuration)) continue
       const start = Math.max(clipStart, visibleStart)
-      const end = clipDuration === undefined ? visibleEnd : Math.min(visibleEnd, clipStart + clipDuration)
-      if (end <= start) continue
+      const end = Math.min(visibleEnd, sweepCutoff, clipDuration === undefined ? Infinity : clipStart + clipDuration)
       const fontSize = track.name === 'Japanese' ? jpFontSize : romanFontSize
       const weight = track.name === 'Japanese' ? 800 : 700
       const text = `{\\an${isDouble ? left ? 4 : 6 : 5}\\pos(${rowX},${track.y})\\fs${fontSize}\\b${weight}}` + karaokeText(track.units, offset, start)
-      events.push(`Dialogue: 0,${assTime(start - clipStart)},${assTime(end - clipStart)},${track.name},,0,0,0,,${text}`)
+      if (end > start) events.push(`Dialogue: 0,${assTime(start - clipStart)},${assTime(end - clipStart)},${track.name},,0,0,0,,${text}`)
+      // After the next line starts, keep this row visible without sweeping it.
+      if (isDouble && last > cutoff && cutoff < rowEnd) {
+        const staticStart = Math.max(clipStart, visibleStart, cutoff)
+        const staticEnd = Math.min(rowEnd, clipDuration === undefined ? Infinity : clipStart + clipDuration)
+        if (staticEnd > staticStart) {
+          const placement = text.slice(0, text.indexOf('}') + 1)
+          const staticText = placement + assText(track.units.map(unit => unit.text).join(''))
+          events.push(`Dialogue: 0,${assTime(staticStart - clipStart)},${assTime(staticEnd - clipStart)},${track.name},,0,0,0,,${staticText}`)
+        }
+      }
     }
     if (isDouble && hasBreakBefore(visibleLines, index)) {
       const onset = lineOnset(line) + offset

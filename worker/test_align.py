@@ -1,8 +1,10 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
-from align import SudachiReading, anchored_line_end, forced_ctc, japanese_target, load_pretrained, phoneme_times, reading_indices, roman_target, subsequence_indices, units_from_centers
+from align import SudachiReading, align_whole_song_by_romaji, anchored_line_end, forced_ctc, forced_ctc_global, japanese_target, load_pretrained, phoneme_times, reading_indices, roman_target, subsequence_indices, units_from_centers
 
 
 class AlignmentTests(unittest.TestCase):
@@ -40,6 +42,36 @@ class AlignmentTests(unittest.TestCase):
         self.assertEqual(centers, [1, 3, 5])
         self.assertGreater(score, 0.9)
 
+    def test_whole_song_trellis_keeps_letter_order(self):
+        probabilities = np.full((8, 4), 0.01)
+        for frame, token in enumerate([0, 1, 0, 2, 0, 3, 0, 0]):
+            probabilities[frame, token] = 0.97
+        centers, scores = forced_ctc_global(np.log(probabilities), [1, 2, 3], 0)
+        self.assertEqual(centers, [1, 3, 5])
+        self.assertTrue(all(score > 0.9 for score in scores))
+
+    def test_romaji_global_alignment_ignores_lrc_timestamps(self):
+        from pykakasi import kakasi
+
+        probabilities = np.full((8, 3), 0.01)
+        for frame, token in enumerate([0, 1, 0, 0, 0, 2, 0, 0]):
+            probabilities[frame, token] = 0.97
+        class Tokenizer:
+            unk_token_id = 99
+            def __call__(self, text, **_kwargs):
+                return SimpleNamespace(input_ids=[{"a": 1, "i": 2}[letter] for letter in text])
+        processor = SimpleNamespace(tokenizer=Tokenizer())
+        lines = [{"start": 100, "end": 101, "text": "あ", "romaji": "a"},
+                 {"start": 200, "end": 201, "text": "い", "romaji": "i"}]
+        with patch("align.whole_song_emissions", return_value=(np.log(probabilities), [frame * 0.1 for frame in range(8)])):
+            result, warning = align_whole_song_by_romaji(lines, None, processor, None, None,
+                                                          SudachiReading(kakasi()), 0)
+        self.assertIsNone(warning)
+        self.assertEqual([line["index"] for line in result], [0, 1])
+        self.assertLess(result[0]["start"], 1)
+        self.assertLess(result[1]["start"], 1)
+        self.assertLess(result[0]["start"], result[1]["start"])
+
     def test_roman_mapping_preserves_spaces(self):
         target, spans = roman_target('kimi ga')
         self.assertEqual(target, 'kimiga')
@@ -52,6 +84,19 @@ class AlignmentTests(unittest.TestCase):
         target, spans = japanese_target('世界が', SudachiReading(kakasi()))
         self.assertEqual(target, 'sekaiga')
         self.assertEqual(len(spans), 3)
+
+    def test_english_only_line_aligns_written_english_without_romaji(self):
+        from pykakasi import kakasi
+        text = 'I know, right？'
+        target, spans = japanese_target(text, SudachiReading(kakasi()))
+        self.assertEqual(target, 'iknowright')
+        self.assertEqual((target, spans), roman_target(text))
+
+    def test_mixed_japanese_and_english_still_uses_japanese_reading(self):
+        from pykakasi import kakasi
+        target, spans = japanese_target('君と Just Friends', SudachiReading(kakasi()))
+        self.assertTrue(target.startswith('kimito'))
+        self.assertEqual(len(spans), len('君と Just Friends'))
 
     def test_japanese_spaces_and_punctuation_do_not_become_spoken_words(self):
         from pykakasi import kakasi

@@ -30,13 +30,21 @@ export function splitUnits(text: string, start: number, end: number): TimedUnit[
   }))
 }
 
+function isEnglishOnly(text: string): boolean {
+  const letters = text.normalize('NFKD').match(/\p{L}/gu) ?? []
+  return letters.length > 0 && letters.every(letter => /[a-z]/i.test(letter))
+}
+
 export function createLines(japanese: RawLine[], romanized: RawLine[], duration?: number): LyricLine[] {
   return japanese.map((line, index) => {
     const next = japanese[index + 1]
     const audioEnd = duration && duration > line.start ? duration : Number.POSITIVE_INFINITY
     const end = Math.max(line.start + 0.05, Math.min(audioEnd, next ? Math.min(next.start, line.start + 15) : line.start + 8))
-    const romajiLine = romanized.find(x => Math.abs(x.start - line.start) < 0.75)
-      ?? (romanized.length === japanese.length ? romanized[index] : undefined)
+    // English lyrics already provide the Latin reading. A nearby romaji LRC
+    // entry may belong to the following Japanese line when the file omits it.
+    const romajiLine = isEnglishOnly(line.text) ? undefined
+      : romanized.find(x => Math.abs(x.start - line.start) < 0.75)
+        ?? (romanized.length === japanese.length ? romanized[index] : undefined)
     return {
       id: `line-${index}`,
       start: line.start,

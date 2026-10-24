@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { LyricLine, TimedUnit } from './types'
 import { api } from './api'
 
@@ -25,6 +25,19 @@ const draft = ref<LyricLine>({
   units: props.line.units.map(unit => ({ ...unit })),
   romajiUnits: props.line.romajiUnits?.map(unit => ({ ...unit })),
 })
+const draftKey = `ktvplay:timing-draft:${props.songId}:${props.line.id}`
+const savedContent = JSON.stringify({ units: props.line.units, romajiUnits: props.line.romajiUnits ?? [] })
+const unsaved = computed(() => JSON.stringify({ units: draft.value.units, romajiUnits: draft.value.romajiUnits ?? [] }) !== savedContent)
+watch(draft, () => {
+  try {
+    if (unsaved.value) localStorage.setItem(draftKey, JSON.stringify({
+      lineText: props.line.text,
+      units: draft.value.units,
+      romajiUnits: draft.value.romajiUnits ?? [],
+    }))
+    else localStorage.removeItem(draftKey)
+  } catch { /* The editor remains usable when browser storage is unavailable. */ }
+}, { deep: true, flush: 'sync' })
 const romajiText = computed({
   get: () => draft.value.romajiUnits?.map(unit => unit.text).join('') ?? draft.value.romaji ?? '',
   set: value => updateRomajiText(value),
@@ -198,7 +211,23 @@ async function alignCurrentLine(): Promise<void> {
   } finally { aligning.value = false }
 }
 function onKeydown(event: KeyboardEvent): void { if (event.key === 'Escape') emit('close') }
-onMounted(() => window.addEventListener('keydown', onKeydown))
+onMounted(() => {
+  window.addEventListener('keydown', onKeydown)
+  try {
+    const stored = localStorage.getItem(draftKey)
+    if (!stored) return
+    const restored = JSON.parse(stored) as { lineText?: string; units?: TimedUnit[]; romajiUnits?: TimedUnit[] }
+    const valid = (items: unknown): items is TimedUnit[] => Array.isArray(items)
+      && items.every(unit => unit && typeof unit.text === 'string' && Number.isFinite(unit.start)
+        && Number.isFinite(unit.end) && unit.start >= 0 && unit.end > unit.start)
+    if (restored.lineText !== props.line.text || !valid(restored.units) || !valid(restored.romajiUnits)
+      || restored.units.map(unit => unit.text).join('') !== props.line.text) return
+    draft.value.units = restored.units
+    draft.value.romajiUnits = restored.romajiUnits.length ? restored.romajiUnits : undefined
+    draft.value.romaji = restored.romajiUnits.map(unit => unit.text).join('') || undefined
+    if (unsaved.value) alignNotice.value = '已恢复上次未保存的修改。确认后点击“保存校时”写入歌曲。'
+  } catch { /* Ignore damaged or unavailable browser storage. */ }
+})
 onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 </script>
 
@@ -252,7 +281,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 
       <div v-if="error || alignError" class="timing-error" role="alert">{{ alignError || error }}</div>
       <div v-if="alignNotice" class="timing-notice" role="status">{{ alignNotice }}</div>
-      <footer class="timing-actions"><button type="button" class="timing-cancel" @click="emit('close')">取消</button><button type="button" class="timing-realign" :title="`按当前${lane === 'romaji' ? '罗马音' : '日文歌词'}重新校时本句`" :disabled="aligning || saving || (lane === 'romaji' && !draft.romajiUnits?.length)" @click="alignCurrentLine">{{ aligning ? '本句校时中…' : '本句重新校时' }}</button><button type="button" class="timing-save" :disabled="saving || aligning" @click="save">{{ saving ? '保存中…' : '保存校时' }}</button></footer>
+      <footer class="timing-actions"><span v-if="unsaved" class="timing-draft-state">未保存 · 已保留在本机草稿</span><button type="button" class="timing-cancel" @click="emit('close')">取消</button><button type="button" class="timing-realign" :title="`按当前${lane === 'romaji' ? '罗马音' : '日文歌词'}重新校时本句`" :disabled="aligning || saving || (lane === 'romaji' && !draft.romajiUnits?.length)" @click="alignCurrentLine">{{ aligning ? '本句校时中…' : '本句重新校时' }}</button><button type="button" class="timing-save" :disabled="saving || aligning" @click="save">{{ saving ? '保存中…' : '保存校时' }}</button></footer>
     </section>
   </div>
 </template>
@@ -267,6 +296,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .timing-romaji-actions{display:flex;gap:8px;margin-top:15px}.timing-remove,.timing-undo{border:1px solid #775367;background:#3b283c;color:#ffd6df;border-radius:8px;padding:8px 11px;font-size:12px;cursor:pointer}.timing-undo{border-color:#66557f;background:#302744;color:#e4d6fc}.timing-romaji-empty{margin-top:15px;padding:18px;border:1px dashed #66557f;border-radius:10px;color:#c9bddc;font-size:12px;display:flex;align-items:center;justify-content:space-between;gap:10px}
 .timing-romaji-edit{display:grid;gap:7px;margin:12px 0 14px;color:#d8c9ed;font-size:12px;font-weight:700}.timing-romaji-edit input{width:100%;padding:11px 12px;border:1px solid #66557f;border-radius:9px;background:#211b32;color:#f4ebff;font-size:14px;font-weight:500;letter-spacing:.02em}.timing-romaji-edit input:focus{outline:2px solid #a584f3;outline-offset:1px}.timing-romaji-edit small{color:#a99dbd;font-size:11px;font-weight:400}
 .timing-header,.timing-preview,.timing-workspace,.timing-actions{flex-shrink:0}.timing-workspace.busy{pointer-events:none;opacity:.65}.timing-notice{color:#d7f7dd;background:#244034;border-radius:9px;padding:10px 12px;font-size:12px}.timing-actions{position:sticky;bottom:-24px;z-index:5;background:#1b192a;margin:0 -24px -24px;padding:14px 24px 24px;box-shadow:0 -10px 24px #0b091355}.timing-realign{border:1px solid #856aae;background:#41335e;color:#f0e6ff}.timing-actions button:disabled{opacity:.6;cursor:wait}
+.timing-draft-state{margin-right:auto;align-self:center;color:#d9b9ff;font-size:11px}
 @media(max-width:620px){.timing-backdrop{padding:8px}.timing-modal{padding:15px;gap:13px;max-height:98vh}.timing-preview-jp{font-size:20px}.timing-transport{flex-wrap:wrap}.timing-focus{padding:12px}.timing-boundary{grid-template-columns:32px minmax(0,1fr) 55px;gap:6px}.timing-fine{gap:8px}.timing-tabs button{padding:8px 9px}}
 @media(max-width:620px){.timing-actions{flex-wrap:wrap;bottom:-15px;margin:0 -15px -15px;padding:12px 15px 15px}.timing-realign{margin-left:auto}}
 </style>

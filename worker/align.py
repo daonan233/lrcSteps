@@ -56,6 +56,11 @@ def normalized_latin(text: str) -> str:
     return "".join(char for char in folded if "a" <= char <= "z")
 
 
+def is_english_only(text: str) -> bool:
+    letters = [char for char in unicodedata.normalize("NFKD", text) if char.isalpha()]
+    return bool(letters) and all(normalized_latin(char) for char in letters)
+
+
 def japanese_target(text: str, kakasi) -> tuple[str, list[tuple[int, int]]]:
     """Return romaji target and a target-letter span for each visible glyph.
 
@@ -63,6 +68,11 @@ def japanese_target(text: str, kakasi) -> tuple[str, list[tuple[int, int]]]:
     Its pronunciation letters are allocated proportionally across glyphs; the
     UI keeps the original text and reports these times as estimates.
     """
+    # Transliteration turns English words into Japanese-sounding syllables
+    # (for example "I know, right?" -> "ainouraito"). Use the written English
+    # as the spoken target when the entire line is already Latin text.
+    if is_english_only(text):
+        return roman_target(text)
     target = ""
     spans: list[tuple[int, int]] = []
     for chunk in kakasi.convert(text):
@@ -250,9 +260,14 @@ def forced_ctc(log_probs, labels: list[int], blank_id: int) -> tuple[list[int], 
 def units_from_centers(text: str, spans: list[tuple[int, int]], centers: list[int],
                        window_start: float, window_end: float, frame_count: int,
                        line_start: float, line_end: float, minimum_duration: float = 0.01) -> list[dict]:
-    visible = graphemes(text)
     scale = (window_end - window_start) / frame_count
     char_times = [window_start + (center + 0.5) * scale for center in centers]
+    return units_from_times(text, spans, char_times, line_start, line_end, minimum_duration)
+
+
+def units_from_times(text: str, spans: list[tuple[int, int]], char_times: list[float],
+                     line_start: float, line_end: float, minimum_duration: float = 0.01) -> list[dict]:
+    visible = graphemes(text)
     glyph_centers: list[float | None] = []
     for start, end in spans:
         glyph_centers.append(sum(char_times[start:end]) / (end - start) if end > start else None)
@@ -283,6 +298,151 @@ def units_from_centers(text: str, spans: list[tuple[int, int]], centers: list[in
         end = boundaries[index + 1]
         units.append({"text": glyph, "start": round(start, 3), "end": round(end, 3)})
     return units
+
+
+def forced_ctc_global(log_probs, labels: list[int], blank_id: int) -> tuple[list[float], list[float]]:
+    """Vectorized CTC trellis for a whole song; backpointers use one byte per state."""
+    import numpy as np
+
+    frame_count = log_probs.shape[0]
+    repeats = sum(left == right for left, right in zip(labels, labels[1:]))
+    if not labels or frame_count < len(labels) + repeats:
+        raise ValueError("罗马音内容过长，超过音频可容纳的长度")
+    state_count = 2 * len(labels) + 1
+    state_labels = np.empty(state_count, dtype=np.int32)
+    state_labels[0::2] = blank_id
+    state_labels[1::2] = labels
+    skip = np.zeros(state_count, dtype=bool)
+    skip[3::2] = np.asarray(labels[1:]) != np.asarray(labels[:-1])
+    skip_indices = np.flatnonzero(skip)
+    back = np.zeros((frame_count, state_count), dtype=np.uint8)
+    previous = np.full(state_count, -np.inf, dtype=np.float32)
+    previous[0] = log_probs[0, blank_id]
+    previous[1] = log_probs[0, labels[0]]
+    from_one = np.empty_like(previous)
+    from_two = np.empty_like(previous)
+    for frame in range(1, frame_count):
+        from_one[0] = -np.inf
+        from_one[1:] = previous[:-1]
+        from_two[:] = -np.inf
+        from_two[skip_indices] = previous[skip_indices - 2]
+        best = previous.copy()
+        choice = np.zeros(state_count, dtype=np.uint8)
+        take_one = from_one > best
+        best[take_one] = from_one[take_one]
+        choice[take_one] = 1
+        take_two = from_two > best
+        best[take_two] = from_two[take_two]
+        choice[take_two] = 2
+        previous = best + log_probs[frame, state_labels]
+        back[frame] = choice
+    state = state_count - 1 if previous[-1] >= previous[-2] else state_count - 2
+    if not np.isfinite(previous[state]):
+        raise ValueError("音频和罗马音无法完成全曲对齐")
+    sums = np.zeros(len(labels), dtype=np.float64)
+    counts = np.zeros(len(labels), dtype=np.int32)
+    strengths = np.zeros(len(labels), dtype=np.float64)
+    for frame in range(frame_count - 1, -1, -1):
+        if state % 2:
+            index = state // 2
+            sums[index] += frame
+            counts[index] += 1
+            strengths[index] += math.exp(float(log_probs[frame, labels[index]]))
+        state -= int(back[frame, state])
+    if not np.all(counts):
+        raise ValueError("部分罗马音没有找到可靠的音频位置")
+    return (sums / counts).tolist(), (strengths / counts).tolist()
+
+
+def whole_song_emissions(waveform, processor, model, device) -> tuple[object, list[float]]:
+    """Infer the entire track in bounded chunks without using lyric timestamps."""
+    import numpy as np
+    import torch
+
+    core_samples = 20 * SAMPLE_RATE
+    margin_samples = SAMPLE_RATE // 2
+    emissions = []
+    times: list[float] = []
+    for core_start in range(0, len(waveform), core_samples):
+        core_end = min(len(waveform), core_start + core_samples)
+        clip_start = max(0, core_start - margin_samples)
+        clip_end = min(len(waveform), core_end + margin_samples)
+        clip = waveform[clip_start:clip_end]
+        inputs = processor(clip, sampling_rate=SAMPLE_RATE, return_tensors="pt")
+        with torch.inference_mode():
+            logits = model(**{key: value.to(device) for key, value in inputs.items()}).logits[0]
+            scores = logits.log_softmax(-1).cpu().numpy()
+        frame_times = (clip_start + (np.arange(len(scores)) + 0.5)
+                       * (clip_end - clip_start) / len(scores)) / SAMPLE_RATE
+        keep = (frame_times >= core_start / SAMPLE_RATE) & (frame_times < core_end / SAMPLE_RATE)
+        emissions.append(scores[keep])
+        times.extend(frame_times[keep].tolist())
+    return np.concatenate(emissions), times
+
+
+def align_whole_song_by_romaji(lines: list[dict], waveform, processor, model, device,
+                               converter, blank_id: int) -> tuple[list[dict], str | None]:
+    """Align ordered romanized text to audio; all LRC timestamps are ignored."""
+    import numpy as np
+
+    targets: list[tuple[int, str, str, list[tuple[int, int]], int]] = []
+    full_reading = ""
+    skipped = 0
+    for index, line in enumerate(lines):
+        display = line.get("romaji") or ""
+        reading, spans = roman_target(display)
+        if not reading:
+            display = line["text"]
+            reading, spans = roman_target(display)
+        if not reading:
+            skipped += 1
+            continue
+        targets.append((index, display, reading, spans, len(full_reading)))
+        full_reading += reading
+    if skipped:
+        raise ValueError(f"有 {skipped} 句没有罗马音，请先在逐句调整里补全后再进行全曲校时")
+    if not targets:
+        raise ValueError("没有可用于全曲校时的罗马音；请先补上罗马音")
+    token_ids = processor.tokenizer(full_reading, add_special_tokens=False).input_ids
+    if len(token_ids) != len(full_reading) or any(token == processor.tokenizer.unk_token_id for token in token_ids):
+        raise ValueError("校时模型不支持部分罗马音字符")
+    emissions, frame_times = whole_song_emissions(waveform, processor, model, device)
+    frame_centers, strengths = forced_ctc_global(emissions, token_ids, blank_id)
+    letter_times = np.interp(frame_centers, np.arange(len(frame_times)), frame_times).tolist()
+    aligned: list[dict] = []
+    for position, (index, display, reading, spans, offset) in enumerate(targets):
+        times = letter_times[offset:offset + len(reading)]
+        first, last = times[0], times[-1]
+        next_first = (letter_times[targets[position + 1][4]] if position + 1 < len(targets) else None)
+        line_start = max(0.0, first - 0.08)
+        line_end = last + 0.28
+        if next_first is not None and next_first > last + 0.04:
+            line_end = min(line_end, next_first - 0.02)
+        line_end = max(line_start + 0.05, line_end)
+        roman_units = units_from_times(display, spans, times, line_start, line_end, 0.035)
+        japanese_reading, japanese_spans = japanese_target(lines[index]["text"], converter)
+        mapping = reading_indices(japanese_reading, reading) if japanese_reading else None
+        if mapping is not None:
+            japanese_times = [interpolate_center(times, value) for value in mapping]
+        elif japanese_reading:
+            japanese_times = np.interp(np.linspace(0, len(times) - 1, len(japanese_reading)),
+                                       np.arange(len(times)), times).tolist()
+        else:
+            japanese_spans = [(round(len(times) * glyph / len(graphemes(lines[index]["text"]))),
+                               round(len(times) * (glyph + 1) / len(graphemes(lines[index]["text"]))))
+                              for glyph in range(len(graphemes(lines[index]["text"]))) ]
+            japanese_times = times
+        japanese_units = units_from_times(lines[index]["text"], japanese_spans, japanese_times,
+                                          line_start, line_end, 0.035)
+        confidence = round(float(np.mean(strengths[offset:offset + len(reading)])), 3)
+        aligned.append({"index": index, "start": round(line_start, 3), "end": round(line_end, 3),
+                        "units": japanese_units,
+                        "romajiUnits": roman_units if lines[index].get("romaji") else None,
+                        "confidence": confidence,
+                        "method": "aligned" if confidence >= 0.1 else "estimated"})
+    uncertain = sum(item["confidence"] < 0.2 for item in aligned)
+    warning = f"{uncertain} 句罗马音与声音匹配把握较低，请逐句检查。" if uncertain else None
+    return aligned, warning
 
 
 def ffmpeg_executable() -> str:
@@ -401,6 +561,13 @@ def main(input_path: str, output_path: str) -> None:
         if blank_id is None:
             raise RuntimeError("声学模型没有提供 CTC blank token")
         converter = SudachiReading(kakasi())
+        if request.get("mode") == "romaji_global":
+            results, alignment_warning = align_whole_song_by_romaji(
+                lines, waveform, processor, model, device, converter, int(blank_id))
+            combined_warning = " ".join(item for item in (warning, alignment_warning) if item) or None
+            Path(output_path).write_text(json.dumps({"lines": results, "warning": combined_warning},
+                                                    ensure_ascii=False), encoding="utf-8")
+            return
         results = []
         for index, line in enumerate(lines):
             start = float(line["start"])

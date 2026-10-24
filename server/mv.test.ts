@@ -61,6 +61,23 @@ test('double row ASS preloads the next lyric and alternates rows while both scri
   assert.equal(validMvStyle({ ...adjusted, rightX: 0.2 }), false)
 })
 
+test('overlapping lyric stops sweeping when the following line begins', () => {
+  const lines: LyricLine[] = [10, 12, 14].map((start, index) => ({
+    id: String(index), start, end: index === 1 ? 16 : start + 1, text: `歌${index}`,
+    confidence: 1, method: 'manual',
+    units: [{ text: `歌${index}`, start, end: index === 1 ? 16 : start + 1 }],
+  }))
+  const double = generateAss(lines, 0, defaultMvStyle, 1920, 1080, 0, undefined, 'double')
+  const middle = double.split('\n').filter(line => line.includes(',Japanese,,') && line.includes('歌1'))
+  assert.equal(middle.length, 2)
+  assert.match(middle[0], /^Dialogue: 0,0:00:08\.00,0:00:14\.00,Japanese/)
+  assert.match(middle[0], /\\kf400\}歌1/)
+  assert.match(middle[1], /^Dialogue: 0,0:00:14\.00,0:00:18\.00,Japanese/)
+  assert.doesNotMatch(middle[1], /\\kf/)
+  const single = generateAss(lines, 0, defaultMvStyle, 1920, 1080)
+  assert.match(single, /^Dialogue: 0,0:00:12\.00,0:00:14\.00,Japanese/m)
+})
+
 test('double row preloads after an instrumental break and removes gray dots from right to left', () => {
   const lines: LyricLine[] = [10, 12, 30].map((start, index) => ({
     id: String(index), start, end: start + 1, text: `歌${index}`, romaji: `uta${index}`,

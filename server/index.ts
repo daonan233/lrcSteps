@@ -68,11 +68,25 @@ app.post('/api/netease/lyrics', async (request, response) => {
 })
 app.get('/api/songs', async (_request, response) => {
   const songs = (listSongs.all() as { payload: string }[]).map(row => JSON.parse(row.payload) as Song)
-  response.json(songs.map(song => ({ ...publicSong(song), lines: undefined, lineCount: song.lines.length })))
+  response.json(songs.map(song => ({ ...publicSong(song), lines: undefined, lineCount: song.lines.length,
+    manualCount: song.lines.filter(line => line.method === 'manual').length })))
 })
 app.get('/api/songs/:id', async (request, response) => {
   const song = await readSong(request.params.id)
   if (!song) return response.status(404).json({ error: '找不到歌曲' })
+  response.json(publicSong(song))
+})
+
+app.patch('/api/songs/:id/lyrics-delay', async (request, response) => {
+  const song = await readSong(request.params.id)
+  if (!song) return response.status(404).json({ error: '找不到歌曲' })
+  const delayMs = request.body?.delayMs
+  if (!Number.isInteger(delayMs) || delayMs < -2000 || delayMs > 3000) {
+    return response.status(400).json({ error: '歌词延迟需在 -2 到 +3 秒之间' })
+  }
+  song.lyricsDelayMs = delayMs
+  await saveSong(song)
+  invalidateMvExports(song.id)
   response.json(publicSong(song))
 })
 
@@ -225,9 +239,24 @@ app.post('/api/songs/:id/retry', async (request, response) => {
   if (!song) return response.status(404).json({ error: '找不到歌曲' })
   if (song.status === 'queued' || song.status === 'processing') return response.status(409).json({ error: '正在处理' })
   song.status = 'queued'
+  song.alignmentMode = 'lrc'
   song.error = undefined
   await saveSong(song)
   enqueueAlignment(song.id)
+  response.json(publicSong(song))
+})
+
+app.post('/api/songs/:id/align-romaji', async (request, response) => {
+  const song = await readSong(request.params.id)
+  if (!song) return response.status(404).json({ error: '找不到歌曲' })
+  if (song.status === 'queued' || song.status === 'processing') return response.status(409).json({ error: '正在处理' })
+  const missing = song.lines.filter(line => !/[a-z]/i.test((line.romaji || line.text).normalize('NFKD')))
+  if (missing.length) return response.status(400).json({ error: `有 ${missing.length} 句缺少罗马音，请先补齐后重试` })
+  song.status = 'queued'
+  song.alignmentMode = 'romaji'
+  song.error = undefined
+  await saveSong(song)
+  enqueueRomajiAlignment(song.id)
   response.json(publicSong(song))
 })
 
@@ -245,7 +274,7 @@ function validateUnits(units: TimedUnit[] | undefined, text: string): units is T
     Number.isFinite(unit.start) && Number.isFinite(unit.end) && unit.start >= 0 && unit.end > unit.start
     && (index === 0 || unit.start >= units[index - 1].start))
 }
-interface AlignedLine { index: number; units?: TimedUnit[]; romajiUnits?: TimedUnit[]; confidence: number; method: 'aligned' | 'estimated' }
+interface AlignedLine { index: number; start?: number; end?: number; units?: TimedUnit[]; romajiUnits?: TimedUnit[]; confidence: number; method: 'aligned' | 'estimated' }
 let queue: Promise<void> = Promise.resolve()
 function scheduleAlignment<T>(task: () => Promise<T>): Promise<T> {
   const job = queue.then(task)
@@ -254,6 +283,59 @@ function scheduleAlignment<T>(task: () => Promise<T>): Promise<T> {
 }
 function enqueueAlignment(id: string): void {
   void scheduleAlignment(() => runAlignment(id)).catch(error => console.error('Alignment job failed:', error))
+}
+function enqueueRomajiAlignment(id: string): void {
+  void scheduleAlignment(() => runRomajiAlignment(id)).catch(error => console.error('Romaji alignment job failed:', error))
+}
+async function runRomajiAlignment(id: string): Promise<void> {
+  let song = await readSong(id)
+  if (!song) return
+  song.status = 'processing'
+  await saveSong(song)
+  const lineSnapshot = JSON.stringify(song.lines)
+  const input = path.join(uploadsDir, `${id}-romaji-${randomUUID()}-input.json`)
+  const output = path.join(uploadsDir, `${id}-romaji-${randomUUID()}-output.json`)
+  try {
+    await fs.writeFile(input, JSON.stringify({ mode: 'romaji_global', audio: path.join(audioDir, song.audioFile), lines: song.lines }), 'utf8')
+    await runWorker(input, output)
+    const result = JSON.parse(await fs.readFile(output, 'utf8')) as { lines: AlignedLine[]; warning?: string }
+    song = await readSong(id)
+    if (!song) return
+    if (JSON.stringify(song.lines) !== lineSnapshot) {
+      throw new Error('校时期间歌词被修改，已保留新修改；请重新点击罗马音全曲校时')
+    }
+    if (result.lines.length !== song.lines.length || result.lines.some((item, index) => {
+      const line = song!.lines[index]
+      return item.index !== index || !Number.isFinite(item.start) || !Number.isFinite(item.end)
+        || item.end! <= item.start! || !validateUnits(item.units, line.text)
+        || (line.romaji && !validateUnits(item.romajiUnits, line.romaji))
+    })) throw new Error('全曲校时结果不完整，已保留原时间')
+    const backupDir = path.join(dataDir, 'backups')
+    await fs.mkdir(backupDir, { recursive: true })
+    await fs.writeFile(path.join(backupDir, `${id}-before-romaji-${Date.now()}.json`), JSON.stringify(song), 'utf8')
+    for (const item of result.lines) {
+      const line = song.lines[item.index]
+      line.start = item.start!
+      line.end = item.end!
+      line.units = item.units!
+      if (line.romaji) line.romajiUnits = item.romajiUnits!
+      line.confidence = Math.max(0, Math.min(1, item.confidence))
+      if (line.method !== 'manual') line.method = item.method
+    }
+    song.status = song.lines.some(line => line.method === 'estimated' || (line.confidence ?? 0) < 0.55) ? 'needs-review' : 'ready'
+    song.error = result.warning
+    await saveSong(song)
+    invalidateMvExports(song.id)
+  } catch (error) {
+    song = await readSong(id)
+    if (song) {
+      song.status = 'needs-review'
+      song.error = error instanceof Error ? error.message : '罗马音全曲校时失败'
+      await saveSong(song)
+    }
+  } finally {
+    await Promise.all([input, output].map(file => fs.rm(file, { force: true }).catch(() => undefined)))
+  }
 }
 async function runAlignment(id: string): Promise<void> {
   let song = await readSong(id)
@@ -323,5 +405,8 @@ const port = Number(process.env.PORT || 3001)
 app.listen(port, () => console.log(`KTV API listening at http://localhost:${port}`))
 for (const row of listSongs.all() as { payload: string }[]) {
   const song = JSON.parse(row.payload) as Song
-  if (song && (song.status === 'queued' || song.status === 'processing')) enqueueAlignment(song.id)
+  if (song && (song.status === 'queued' || song.status === 'processing')) {
+    if (song.alignmentMode === 'romaji') enqueueRomajiAlignment(song.id)
+    else enqueueAlignment(song.id)
+  }
 }

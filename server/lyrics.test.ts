@@ -21,6 +21,15 @@ test('line construction keeps optional romaji and bounded estimates', () => {
   assert.equal(lines[0].method, 'estimated')
 })
 
+test('English-only lyrics use their own text when the romaji LRC omits that line', () => {
+  const japanese = parseLrc('[00:10.00]I know, right？\n[00:10.70]いつもふざけていても')
+  const romaji = parseLrc('[00:10.65]i tsu mo fu za ke te i te mo')
+  const lines = createLines(japanese, romaji, 15)
+  assert.equal(lines[0].romaji, undefined)
+  assert.equal(lines[0].romajiUnits, undefined)
+  assert.equal(lines[1].romaji, 'i tsu mo fu za ke te i te mo')
+})
+
 test('grapheme splitter does not split combining marks', () => {
   const units = splitUnits('か\u3099な', 0, 2)
   assert.deepEqual(units.map(unit => unit.text), ['か\u3099', 'な'])

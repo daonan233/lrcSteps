@@ -24,6 +24,8 @@ export interface Song {
   originalAudioName: string
   createdAt: string
   status: 'queued' | 'processing' | 'ready' | 'needs-review' | 'failed'
+  alignmentMode?: 'lrc' | 'romaji'
+  lyricsDelayMs?: number
   error?: string
   lines: LyricLine[]
 }

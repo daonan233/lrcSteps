@@ -25,6 +25,7 @@ const currentTime = ref(0)
 const duration = ref(0)
 const playing = ref(false)
 const volume = ref(0.8)
+const lyricsDelayMs = ref(0)
 const editor = ref<LyricLine | null>(null)
 const editorError = ref('')
 const saving = ref(false)
@@ -34,17 +35,16 @@ let poller: ReturnType<typeof setInterval> | undefined
 
 const activeIndex = computed(() => {
   const lines = selected.value?.lines ?? []
-  let index = lines.findLastIndex(line => currentTime.value >= line.start)
-  while (index > 0 && currentTime.value < lines[index - 1].end) index--
-  return index
+  return lines.findLastIndex(line => lyricTime.value >= line.start)
 })
+const lyricTime = computed(() => currentTime.value - lyricsDelayMs.value / 1000)
 const activeLine = computed(() => selected.value?.lines[activeIndex.value])
 const previousLine = computed(() => selected.value?.lines[activeIndex.value - 1])
 const nextLine = computed(() => selected.value?.lines[activeIndex.value + 1] ?? selected.value?.lines[0])
 const reviewCount = computed(() => selected.value?.lines.filter(line => line.method === 'estimated' || (line.confidence ?? 0) < 0.55).length ?? 0)
 
 function unitProgress(unit: TimedUnit): number {
-  return Math.max(0, Math.min(100, (currentTime.value - unit.start) / Math.max(0.01, unit.end - unit.start) * 100))
+  return Math.max(0, Math.min(100, (lyricTime.value - unit.start) / Math.max(0.01, unit.end - unit.start) * 100))
 }
 function formatTime(value: number): string {
   if (!Number.isFinite(value)) return '00:00'
@@ -53,7 +53,10 @@ function formatTime(value: number): string {
   return `${minutes}:${seconds}`
 }
 function statusText(song: Song): string {
-  return ({ queued: '等待校时', processing: '正在自动校时', ready: '已完成', 'needs-review': '可播放 · 待检查', failed: '处理失败' })[song.status]
+  if (song.status === 'queued' || song.status === 'processing') {
+    return song.alignmentMode === 'romaji' ? '正在按罗马音全曲校时' : '正在自动校时'
+  }
+  return ({ ready: '已完成', 'needs-review': '可播放 · 待检查', failed: '处理失败' })[song.status]
 }
 async function importNeteaseLyrics(): Promise<void> {
   if (!shareLink.value.trim()) { error.value = '请先粘贴网易云音乐歌曲分享链接'; return }
@@ -96,7 +99,7 @@ async function loadSongs(): Promise<void> {
   songs.value = await api<Song[]>('/api/songs')
   if (selected.value) {
     const listing = songs.value.find(song => song.id === selected.value?.id)
-    if (!listing) selected.value = null
+    if (!listing) { selected.value = null; try { localStorage.removeItem('ktvplay:selected-song') } catch { /* Optional storage. */ } }
     else if (listing.status !== selected.value.status || listing.status === 'processing') {
       selected.value = await api<Song>(`/api/songs/${listing.id}`)
     }
@@ -105,6 +108,8 @@ async function loadSongs(): Promise<void> {
 async function selectSong(id: string): Promise<void> {
   error.value = ''
   selected.value = await api<Song>(`/api/songs/${id}`)
+  lyricsDelayMs.value = selected.value.lyricsDelayMs ?? 0
+  try { localStorage.setItem('ktvplay:selected-song', id) } catch { /* Optional storage. */ }
   currentTime.value = 0
   playing.value = false
   await nextTick()
@@ -154,6 +159,23 @@ async function togglePlay(): Promise<void> {
 }
 function seek(event: Event): void { if (audio.value) audio.value.currentTime = Number((event.target as HTMLInputElement).value) }
 function setVolume(event: Event): void { volume.value = Number((event.target as HTMLInputElement).value); if (audio.value) audio.value.volume = volume.value }
+function onLyricsDelayInput(event: Event): void { lyricsDelayMs.value = Math.round(Number((event.target as HTMLInputElement).value) * 1000) }
+async function saveLyricsDelay(): Promise<void> {
+  if (!selected.value) return
+  const songId = selected.value.id
+  try {
+    const song = await api<Song>(`/api/songs/${songId}/lyrics-delay`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ delayMs: lyricsDelayMs.value }),
+    })
+    if (selected.value?.id === songId) selected.value.lyricsDelayMs = song.lyricsDelayMs
+  } catch (failure) {
+    if (selected.value?.id === songId) lyricsDelayMs.value = selected.value.lyricsDelayMs ?? 0
+    error.value = String(failure instanceof Error ? failure.message : failure)
+  }
+}
+function resetLyricsDelay(): void { lyricsDelayMs.value = 0; void saveLyricsDelay() }
 function syncClock(): void {
   if (audio.value) currentTime.value = audio.value.currentTime
   frame = requestAnimationFrame(syncClock)
@@ -172,10 +194,10 @@ function openEditor(line: LyricLine): void {
   editorError.value = ''
 }
 function closeEditor(): void { editor.value = null; editorError.value = '' }
-function seekEditor(time: number): void { if (audio.value) audio.value.currentTime = time }
+function seekEditor(time: number): void { if (audio.value) audio.value.currentTime = Math.max(0, time + lyricsDelayMs.value / 1000) }
 async function previewEditor(time: number): Promise<void> {
   if (!audio.value) return
-  audio.value.currentTime = time
+  audio.value.currentTime = Math.max(0, time + lyricsDelayMs.value / 1000)
   try { await audio.value.play() }
   catch { editorError.value = '浏览器无法播放这个音频格式' }
 }
@@ -189,6 +211,7 @@ async function saveEditor(units: TimedUnit[], romajiUnits?: TimedUnit[]): Promis
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ units, romajiUnits }),
     })
+    try { localStorage.removeItem(`ktvplay:timing-draft:${selected.value.id}:${editor.value.id}`) } catch { /* Browser storage is optional. */ }
     closeEditor()
     await loadSongs()
   } catch (failure) { editorError.value = String(failure instanceof Error ? failure.message : failure) }
@@ -201,16 +224,32 @@ async function retryAlignment(): Promise<void> {
     await loadSongs()
   } catch (failure) { error.value = String(failure instanceof Error ? failure.message : failure) }
 }
+async function alignByRomaji(): Promise<void> {
+  if (!selected.value) return
+  error.value = ''
+  notice.value = ''
+  try {
+    selected.value = await api<Song>(`/api/songs/${selected.value.id}/align-romaji`, { method: 'POST' })
+    notice.value = '已开始按当前罗马音全曲校时。处理期间可以播放，完成后会自动更新；校时前版本会自动备份。'
+    await loadSongs()
+  } catch (failure) { error.value = String(failure instanceof Error ? failure.message : failure) }
+}
 async function deleteSong(): Promise<void> {
   if (!selected.value || !confirm(`删除「${selected.value.title}」及其音频文件？`)) return
   await api<void>(`/api/songs/${selected.value.id}`, { method: 'DELETE' })
   selected.value = null
+  try { localStorage.removeItem('ktvplay:selected-song') } catch { /* Optional storage. */ }
   await loadSongs()
 }
-function jumpTo(line: LyricLine): void { if (audio.value) audio.value.currentTime = line.start }
+function jumpTo(line: LyricLine): void { if (audio.value) audio.value.currentTime = Math.max(0, line.start + lyricsDelayMs.value / 1000) }
 watch(() => selected.value?.id, () => { editor.value = null })
 onMounted(async () => {
-  try { await loadSongs() } catch { error.value = '无法连接服务器，请确认 Node.js 服务已启动。' }
+  try {
+    await loadSongs()
+    let storedId: string | null = null
+    try { storedId = localStorage.getItem('ktvplay:selected-song') } catch { /* Optional storage. */ }
+    if (storedId && songs.value.some(song => song.id === storedId)) await selectSong(storedId)
+  } catch { error.value = '无法连接服务器，请确认 Node.js 服务已启动。' }
   poller = setInterval(() => { if (songs.value.some(song => ['queued', 'processing'].includes(song.status))) loadSongs().catch(() => undefined) }, 2500)
   frame = requestAnimationFrame(syncClock)
 })
@@ -225,7 +264,7 @@ onUnmounted(() => { if (poller) clearInterval(poller); cancelAnimationFrame(fram
       <div class="song-list">
         <button v-for="song in songs" :key="song.id" class="song-item" :class="{ selected: selected?.id === song.id }" @click="selectSong(song.id)">
           <span class="song-icon">♫</span>
-          <span class="song-copy"><strong>{{ song.title }}</strong><small>{{ song.artist || '未知歌手' }} · {{ song.lineCount }} 行</small></span>
+          <span class="song-copy"><strong>{{ song.title }}</strong><small>{{ song.artist || '未知歌手' }} · {{ song.lineCount }} 行<span v-if="song.manualCount"> · 已校正 {{ song.manualCount }} 句</span></small></span>
           <span v-if="song.status === 'processing' || song.status === 'queued'" class="small-spinner"></span>
         </button>
         <p v-if="!songs.length" class="empty-list">还没有歌曲。上传第一首，开始制作自己的 KTV。</p>
@@ -258,13 +297,13 @@ onUnmounted(() => { if (poller) clearInterval(poller); cancelAnimationFrame(fram
       </section>
 
       <section v-if="workspace === 'songs' && selected" class="player-section">
-        <div class="section-title player-title"><span class="section-number">02</span><div><h2>{{ selected.title }}</h2><p>{{ selected.artist || '未知歌手' }} <span class="separator">/</span> {{ statusText(selected) }}</p></div><div class="player-actions"><button v-if="selected.status === 'needs-review'" class="ghost-button" @click="retryAlignment">重新校时</button><button class="ghost-button danger" @click="deleteSong">删除</button></div></div>
+        <div class="section-title player-title"><span class="section-number">02</span><div><h2>{{ selected.title }}</h2><p>{{ selected.artist || '未知歌手' }} <span class="separator">/</span> {{ statusText(selected) }}</p></div><div class="player-actions"><button class="ghost-button" :disabled="selected.status === 'queued' || selected.status === 'processing'" @click="alignByRomaji">仅按罗马音全曲校时</button><button v-if="selected.status === 'needs-review'" class="ghost-button" @click="retryAlignment">按 LRC 重新校时</button><button class="ghost-button danger" @click="deleteSong">删除</button></div></div>
         <div v-if="selected.error" class="process-note">{{ selected.error }}</div>
         <div class="stage">
           <div class="stage-glow"></div>
           <div class="stage-top"><span>NOW PLAYING</span><span>{{ String(Math.max(0, activeIndex + 1)).padStart(2, '0') }} / {{ String(selected.lines.length).padStart(2, '0') }}</span></div>
           <div class="lyric-stage">
-            <p class="stage-previous">{{ previousLine?.text || '♪' }}</p>
+            <div class="stage-previous">{{ previousLine?.text || '♪' }}</div>
             <div v-if="activeLine" class="active-lyrics">
               <div class="jp-line" aria-label="当前日文歌词"><span v-for="(unit, index) in activeLine.units" :key="index" class="karaoke-unit"><span class="base-text">{{ unit.text }}</span><span class="fill-text" :style="{ width: `${unitProgress(unit)}%` }">{{ unit.text }}</span></span></div>
               <div v-if="activeLine.romajiUnits?.length" class="romaji-line"><span v-for="(unit, index) in activeLine.romajiUnits" :key="index" class="karaoke-unit"><span class="base-text">{{ unit.text }}</span><span class="fill-text" :style="{ width: `${unitProgress(unit)}%` }">{{ unit.text }}</span></span></div>
@@ -272,20 +311,21 @@ onUnmounted(() => { if (poller) clearInterval(poller); cancelAnimationFrame(fram
             <p v-else class="stage-placeholder">音乐即将开始…</p>
             <p class="stage-next">{{ nextLine?.text || '♪' }}</p>
           </div>
-          <div class="stage-bottom"><span class="live-dot"></span><span>{{ selected.status === 'processing' ? '正在分析人声与歌词' : '跟着节奏，一起唱' }}</span><span v-if="activeLine" class="method-pill">{{ activeLine.method === 'manual' ? '手动校正' : activeLine.method === 'aligned' ? '声学校时' : '时间估算' }}</span></div>
+          <div class="stage-bottom"><span class="live-dot"></span><span>{{ selected.status === 'processing' ? selected.alignmentMode === 'romaji' ? '正在按罗马音匹配整首音频' : '正在分析人声与歌词' : '跟着节奏，一起唱' }}</span><span v-if="activeLine" class="method-pill">{{ activeLine.method === 'manual' ? '手动校正' : activeLine.method === 'aligned' ? '声学校时' : '时间估算' }}</span></div>
         </div>
         <audio ref="audio" :src="selected.audioUrl" preload="metadata" @loadedmetadata="onMetadata" @play="playing = true" @pause="playing = false" @ended="playing = false" />
         <div class="controls"><button class="play-button" :aria-label="playing ? '暂停' : '播放'" @click="togglePlay">{{ playing ? '❚❚' : '▶' }}</button><span class="time">{{ formatTime(currentTime) }}</span><input class="seek" type="range" min="0" :max="duration || 1" step="0.01" :value="currentTime" :style="{ '--progress': `${duration ? currentTime / duration * 100 : 0}%` }" @input="seek" /><span class="time">{{ formatTime(duration) }}</span><span class="volume-icon">◖</span><input class="volume" type="range" min="0" max="1" step="0.01" :value="volume" @input="setVolume" /></div>
+        <div class="lyrics-delay"><div><strong>全曲歌词延迟</strong><span>歌词抢在歌声前面时向右拖；播放中实时预览，松手保存</span></div><input type="range" aria-label="全曲歌词延迟" min="-2" max="3" step="0.05" :value="lyricsDelayMs / 1000" @input="onLyricsDelayInput" @change="saveLyricsDelay" /><output>{{ lyricsDelayMs >= 0 ? '+' : '' }}{{ (lyricsDelayMs / 1000).toFixed(2) }} 秒</output><button type="button" class="ghost-button" :disabled="lyricsDelayMs === 0" @click="resetLyricsDelay">归零</button></div>
         <div class="timeline-head"><div><h3>歌词时间轴</h3><p>点击一行跳转播放；点“调整”修改字级时间。</p></div><span v-if="reviewCount" class="review-badge">{{ reviewCount }} 行建议检查</span></div>
         <div class="timeline">
           <div v-for="line in selected.lines" :key="line.id" class="timeline-row" :class="{ current: activeLine?.id === line.id, unsure: line.method === 'estimated' || (line.confidence ?? 0) < 0.55 }">
-            <button class="line-time" @click="jumpTo(line)">{{ formatTime(line.start) }}</button><div class="line-copy" @click="jumpTo(line)"><strong>{{ line.text }}</strong><small v-if="line.romaji">{{ line.romaji }}</small></div><span class="line-method">{{ line.method === 'manual' ? '已校正' : line.method === 'aligned' ? '自动对齐' : '估算' }}</span><button class="edit-button" @click="openEditor(line)">调整</button>
+            <button class="line-time" @click="jumpTo(line)">{{ formatTime(Math.max(0, line.start + lyricsDelayMs / 1000)) }}</button><div class="line-copy" @click="jumpTo(line)"><strong>{{ line.text }}</strong><small v-if="line.romaji">{{ line.romaji }}</small></div><span class="line-method">{{ line.method === 'manual' ? '已校正' : line.method === 'aligned' ? '自动对齐' : '估算' }}</span><button class="edit-button" @click="openEditor(line)">调整</button>
           </div>
         </div>
       </section>
       <section v-else-if="workspace === 'songs'" class="welcome-card"><span>✦</span><h2>选择一首歌，进入你的舞台</h2><p>上传歌曲后，自动校时会在后台运行。处理过程中也能先预览歌词。</p></section>
     </main>
 
-    <TimingEditor v-if="editor && selected" :key="editor.id" :song-id="selected.id" :line="editor" :current-time="currentTime" :playing="playing" :saving="saving" :error="editorError" :duration="duration" @seek="seekEditor" @preview="previewEditor" @toggle="togglePlay" @close="closeEditor" @save="saveEditor" />
+    <TimingEditor v-if="editor && selected" :key="editor.id" :song-id="selected.id" :line="editor" :current-time="lyricTime" :playing="playing" :saving="saving" :error="editorError" :duration="duration" @seek="seekEditor" @preview="previewEditor" @toggle="togglePlay" @close="closeEditor" @save="saveEditor" />
   </div>
 </template>
