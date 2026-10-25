@@ -30,4 +30,6 @@
 .stage-previous-romaji .fill-text{color:#8ee8eb}
 .lyrics-delay{display:flex;align-items:center;gap:13px;margin:0 0 24px;padding:13px 16px;border:1px solid #403850;border-radius:12px;background:#211d31}.lyrics-delay>div{display:grid;gap:3px;min-width:240px}.lyrics-delay strong{font-size:12px;color:#eee6ff}.lyrics-delay span{font-size:11px;color:#a99dbd}.lyrics-delay input[type=range]{flex:1;min-width:100px;accent-color:#ad8af4}.lyrics-delay output{min-width:64px;text-align:right;color:#e9daff;font-size:13px;font-weight:700}.lyrics-delay .ghost-button{padding:8px 10px;font-size:11px}@media(max-width:800px){.lyrics-delay{flex-wrap:wrap}.lyrics-delay>div{width:100%}}
 .player-actions{flex-wrap:wrap;justify-content:flex-end}
+.delete-line-button{background:#3b2835;color:#f2a9bb;white-space:nowrap}.delete-line-button:hover:not(:disabled){background:#633346;color:#ffd4df}
+.delete-line-prompt{font-size:10px;color:#f2a9bb;white-space:nowrap}
 @media(max-width:620px){.player-title{flex-wrap:wrap}.player-title>div:nth-child(2){min-width:0}.player-actions{width:100%;flex-direction:row;justify-content:flex-start}}

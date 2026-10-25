@@ -29,6 +29,8 @@ const lyricsDelayMs = ref(0)
 const editor = ref<LyricLine | null>(null)
 const editorError = ref('')
 const saving = ref(false)
+const deletingLineId = ref<string | null>(null)
+const confirmingLineId = ref<string | null>(null)
 const workspace = ref<'songs' | 'mv'>('songs')
 let frame = 0
 let poller: ReturnType<typeof setInterval> | undefined
@@ -217,6 +219,19 @@ async function saveEditor(units: TimedUnit[], romajiUnits?: TimedUnit[]): Promis
   } catch (failure) { editorError.value = String(failure instanceof Error ? failure.message : failure) }
   finally { saving.value = false }
 }
+async function deleteLine(line: LyricLine): Promise<void> {
+  if (!selected.value || deletingLineId.value) return
+  const songId = selected.value.id
+  deletingLineId.value = line.id
+  error.value = ''
+  try {
+    const song = await api<Song>(`/api/songs/${songId}/lines/${line.id}`, { method: 'DELETE' })
+    if (selected.value?.id === songId) selected.value = song
+    if (editor.value?.id === line.id) closeEditor()
+    await loadSongs()
+  } catch (failure) { error.value = String(failure instanceof Error ? failure.message : failure) }
+  finally { deletingLineId.value = null; confirmingLineId.value = null }
+}
 async function retryAlignment(): Promise<void> {
   if (!selected.value) return
   try {
@@ -242,7 +257,7 @@ async function deleteSong(): Promise<void> {
   await loadSongs()
 }
 function jumpTo(line: LyricLine): void { if (audio.value) audio.value.currentTime = Math.max(0, line.start + lyricsDelayMs.value / 1000) }
-watch(() => selected.value?.id, () => { editor.value = null })
+watch(() => selected.value?.id, () => { editor.value = null; confirmingLineId.value = null })
 onMounted(async () => {
   try {
     await loadSongs()
@@ -316,10 +331,10 @@ onUnmounted(() => { if (poller) clearInterval(poller); cancelAnimationFrame(fram
         <audio ref="audio" :src="selected.audioUrl" preload="metadata" @loadedmetadata="onMetadata" @play="playing = true" @pause="playing = false" @ended="playing = false" />
         <div class="controls"><button class="play-button" :aria-label="playing ? '暂停' : '播放'" @click="togglePlay">{{ playing ? '❚❚' : '▶' }}</button><span class="time">{{ formatTime(currentTime) }}</span><input class="seek" type="range" min="0" :max="duration || 1" step="0.01" :value="currentTime" :style="{ '--progress': `${duration ? currentTime / duration * 100 : 0}%` }" @input="seek" /><span class="time">{{ formatTime(duration) }}</span><span class="volume-icon">◖</span><input class="volume" type="range" min="0" max="1" step="0.01" :value="volume" @input="setVolume" /></div>
         <div class="lyrics-delay"><div><strong>全曲歌词延迟</strong><span>歌词抢在歌声前面时向右拖；播放中实时预览，松手保存</span></div><input type="range" aria-label="全曲歌词延迟" min="-2" max="3" step="0.05" :value="lyricsDelayMs / 1000" @input="onLyricsDelayInput" @change="saveLyricsDelay" /><output>{{ lyricsDelayMs >= 0 ? '+' : '' }}{{ (lyricsDelayMs / 1000).toFixed(2) }} 秒</output><button type="button" class="ghost-button" :disabled="lyricsDelayMs === 0" @click="resetLyricsDelay">归零</button></div>
-        <div class="timeline-head"><div><h3>歌词时间轴</h3><p>点击一行跳转播放；点“调整”修改字级时间。</p></div><span v-if="reviewCount" class="review-badge">{{ reviewCount }} 行建议检查</span></div>
+        <div class="timeline-head"><div><h3>歌词时间轴</h3><p>点击一行跳转播放；点“调整”修改字级时间，也可直接删除整行。</p></div><span v-if="reviewCount" class="review-badge">{{ reviewCount }} 行建议检查</span></div>
         <div class="timeline">
           <div v-for="line in selected.lines" :key="line.id" class="timeline-row" :class="{ current: activeLine?.id === line.id, unsure: line.method === 'estimated' || (line.confidence ?? 0) < 0.55 }">
-            <button class="line-time" @click="jumpTo(line)">{{ formatTime(Math.max(0, line.start + lyricsDelayMs / 1000)) }}</button><div class="line-copy" @click="jumpTo(line)"><strong>{{ line.text }}</strong><small v-if="line.romaji">{{ line.romaji }}</small></div><span class="line-method">{{ line.method === 'manual' ? '已校正' : line.method === 'aligned' ? '自动对齐' : '估算' }}</span><button class="edit-button" @click="openEditor(line)">调整</button>
+            <button class="line-time" @click="jumpTo(line)">{{ formatTime(Math.max(0, line.start + lyricsDelayMs / 1000)) }}</button><div class="line-copy" @click="jumpTo(line)"><strong>{{ line.text }}</strong><small v-if="line.romaji">{{ line.romaji }}</small></div><span class="line-method">{{ line.method === 'manual' ? '已校正' : line.method === 'aligned' ? '自动对齐' : '估算' }}</span><button class="edit-button" @click="openEditor(line)">调整</button><template v-if="confirmingLineId === line.id"><span class="delete-line-prompt">确定删除？</span><button class="edit-button delete-line-button" :disabled="deletingLineId !== null" @click="deleteLine(line)">{{ deletingLineId === line.id ? '删除中…' : '确认删除' }}</button><button class="edit-button" :disabled="deletingLineId !== null" @click="confirmingLineId = null">取消</button></template><button v-else class="edit-button delete-line-button" :disabled="deletingLineId !== null || selected.status === 'queued' || selected.status === 'processing'" :aria-label="`删除歌词行：${line.text}`" @click="confirmingLineId = line.id">删除</button>
           </div>
         </div>
       </section>

@@ -182,6 +182,20 @@ app.put('/api/songs/:id/lines/:lineId', async (request, response) => {
   response.json(publicSong(song))
 })
 
+app.delete('/api/songs/:id/lines/:lineId', async (request, response) => {
+  const song = await readSong(request.params.id)
+  if (!song) return response.status(404).json({ error: '找不到歌曲' })
+  if (song.status === 'queued' || song.status === 'processing') {
+    return response.status(409).json({ error: '自动校时进行中，请完成后再删除歌词行' })
+  }
+  const index = song.lines.findIndex(line => line.id === request.params.lineId)
+  if (index === -1) return response.status(404).json({ error: '找不到歌词行' })
+  song.lines.splice(index, 1)
+  await saveSong(song)
+  invalidateMvExports(song.id)
+  response.json(publicSong(song))
+})
+
 app.post('/api/songs/:id/lines/:lineId/align', async (request, response) => {
   const song = await readSong(request.params.id)
   if (!song) return response.status(404).json({ error: '找不到歌曲' })
